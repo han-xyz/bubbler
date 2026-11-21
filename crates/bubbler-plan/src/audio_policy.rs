@@ -99,7 +99,7 @@ pub fn hook_dirs(env: &Env) -> Vec<PathBuf> {
 /// Full path of the drop-in WirePlumber loads: the first of
 /// [`install_dirs`] that holds a file named [`DROP_IN_NAME`]; `None`
 /// where none does.
-pub fn installed(host: &dyn Host, env: &Env) -> Option<PathBuf> {
+pub(crate) fn installed(host: &dyn Host, env: &Env) -> Option<PathBuf> {
     install_dirs(env).into_iter().find_map(|dir| {
         let path = dir.join(DROP_IN_NAME);
         host.file_type(&path).is_some().then_some(path)
@@ -181,7 +181,7 @@ impl Missing {
 /// What this host is missing of the policy, or `None` where it holds
 /// both files. A copy WirePlumber would pick but cannot read counts as
 /// missing: it cannot load it either.
-pub fn missing(host: &dyn Host, env: &Env) -> Option<Missing> {
+pub(crate) fn missing(host: &dyn Host, env: &Env) -> Option<Missing> {
     let readable = |path: Option<PathBuf>| path.is_some_and(|path| host.read(&path).is_some());
     match (
         readable(installed(host, env)),
@@ -234,7 +234,7 @@ pub fn not_loaded_warning(
 
 /// Whether the not-loaded check gives way to a file that is missing, or differs and that is not
 /// accepted: those findings name the fix, which a restart alone does not make.
-pub fn held_back(accepts_differs: bool, host: &dyn Host, env: &Env) -> bool {
+pub(crate) fn held_back(accepts_differs: bool, host: &dyn Host, env: &Env) -> bool {
     missing(host, env).is_some() || (!accepts_differs && !differing(host, env).is_empty())
 }
 
@@ -266,7 +266,7 @@ pub fn explain_suffix(
 /// then not the grant enforced. The copies compared are [`installed`]
 /// and [`hook_installed`], the ones WirePlumber loads; one it cannot read
 /// is [`missing`] instead.
-pub fn differing(host: &dyn Host, env: &Env) -> Vec<PathBuf> {
+pub(crate) fn differing(host: &dyn Host, env: &Env) -> Vec<PathBuf> {
     [
         (installed(host, env), DROP_IN),
         (hook_installed(host, env), HOOK),
@@ -280,7 +280,7 @@ pub fn differing(host: &dyn Host, env: &Env) -> Vec<PathBuf> {
 }
 
 /// Which of `paths` differ, and what that leaves open.
-pub fn differs_message(paths: &[PathBuf]) -> String {
+pub(crate) fn differs_message(paths: &[PathBuf]) -> String {
     format!(
         "audio policy differs from this bubbler's in {}: under an older policy a sandbox \
          can claim the microphone grant for itself",
@@ -298,7 +298,7 @@ pub fn differs_message(paths: &[PathBuf]) -> String {
 /// shell cannot write, the user's own copy written, which outranks it;
 /// then WirePlumber restarted. Or, for an edit made on purpose, the
 /// `lint-allow` that accepts it.
-pub fn differs_help(paths: &[PathBuf], env: &Env) -> String {
+pub(crate) fn differs_help(paths: &[PathBuf], env: &Env) -> String {
     let steps: Vec<String> = paths
         .iter()
         .map(|path| {
@@ -398,12 +398,12 @@ const UNVERIFIED: &str = "the audio policy the running WirePlumber loaded could 
 const NOT_ENFORCED: &str = "audio grants are not enforced as configured";
 
 /// WirePlumber reads the policy files only when it starts.
-pub const RESTART: &str = "systemctl --user restart wireplumber";
+pub(crate) const RESTART: &str = "systemctl --user restart wireplumber";
 
 impl LoadedRevision {
     /// Which policy the running WirePlumber holds where it is not this
     /// bubbler's; `None` where it is, or where that is not known.
-    pub fn not_loaded(&self) -> Option<String> {
+    pub(crate) fn not_loaded(&self) -> Option<String> {
         match self {
             LoadedRevision::Current
             | LoadedRevision::Unknown(_)
@@ -421,7 +421,7 @@ impl LoadedRevision {
 
     /// Why the loaded policy could not be verified, for
     /// [`Unreadable`](Self::Unreadable); `None` otherwise.
-    pub fn unverified(&self) -> Option<String> {
+    pub(crate) fn unverified(&self) -> Option<String> {
         match self {
             LoadedRevision::Unreadable(reason) => Some(format!("{UNVERIFIED}: {reason}")),
             _ => None,
@@ -529,7 +529,7 @@ pub mod test_support {
     /// What `pw-dump` printed on a bed whose hook states revision 4 (PipeWire 1.6.9, WirePlumber
     /// 0.5.18): WirePlumber's client, its `default` and `bubbler-policy`, a host tool's client and a
     /// playback context's client, each client's properties cut to the access keys.
-    pub const MEASURED: &str = r#"[
+    pub(crate) const MEASURED: &str = r#"[
   {
     "id": 19,
     "type": "PipeWire:Interface:Client",

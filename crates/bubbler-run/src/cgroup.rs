@@ -52,7 +52,7 @@ const RELEASE_POLL: Duration = Duration::from_millis(50);
 /// directories, which the kernel allows only once no process is left in
 /// them: the proxy is stopped and the sandbox has exited by then.
 #[derive(Debug)]
-pub struct SandboxCgroup {
+pub(crate) struct SandboxCgroup {
     // The parent, which holds no process and is removed last.
     dir: PathBuf,
     // The leaf bubbler and therefore the sandbox are in.
@@ -71,13 +71,13 @@ pub struct SandboxCgroup {
 impl SandboxCgroup {
     /// The path and level the nftables rule is written from, which is
     /// the proxy's leaf and never the sandbox's.
-    pub fn spec(&self) -> &network::Cgroup {
+    pub(crate) fn spec(&self) -> &network::Cgroup {
         &self.spec
     }
 
     /// The open `cgroup.procs` of the proxy leaf, which the proxy joins
     /// by writing its pid.
-    pub fn procs(&self) -> BorrowedFd<'_> {
+    pub(crate) fn procs(&self) -> BorrowedFd<'_> {
         self.procs.as_fd()
     }
 
@@ -141,7 +141,7 @@ fn write_pid(dir: &Path, pid: u32) -> std::io::Result<()> {
 /// the proxy leaf, and a run that asked for `allow-host` and got no
 /// cgroup would either have no rules at all or rules naming a path that
 /// resolves to nothing.
-pub fn create(instance: &str, pid: u32) -> Result<SandboxCgroup, LaunchError> {
+pub(crate) fn create(instance: &str, pid: u32) -> Result<SandboxCgroup, LaunchError> {
     create_under(
         Path::new(CGROUP2_ROOT),
         &own_path()?,

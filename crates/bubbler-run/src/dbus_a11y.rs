@@ -66,7 +66,7 @@ pub enum A11yError {
 /// The host accessibility bus address, refused when it lands in
 /// bubbler's own runtime directory. The bus is asked for its address
 /// first, as a run does; the unguarded resolver is crate-private.
-pub fn guarded_host_a11y_bus(host: &dyn Host, env: &Env) -> Result<PathBuf, LaunchError> {
+pub(crate) fn guarded_host_a11y_bus(host: &dyn Host, env: &Env) -> Result<PathBuf, LaunchError> {
     Ok(outside_our_runtime(
         host,
         env,

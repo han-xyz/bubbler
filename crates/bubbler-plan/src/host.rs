@@ -239,7 +239,7 @@ pub mod fake {
     /// The four types a share source can have: regular file, directory,
     /// socket and named pipe. A pipe needs no privilege to make, unlike
     /// the device nodes [`char_type`] borrows from `/dev/null`.
-    pub fn every_type() -> (FileType, FileType, FileType, FileType) {
+    pub(crate) fn every_type() -> (FileType, FileType, FileType, FileType) {
         use std::os::unix::net::UnixListener;
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("f"), b"").unwrap();

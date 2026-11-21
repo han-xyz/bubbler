@@ -35,7 +35,7 @@ impl Version {
     /// Whether this is older than `floor`. [`Version::Unknown`] is: a
     /// tool that will not say which version it is cannot be trusted to
     /// be the one that carries the fix.
-    pub fn below(self, floor: (u32, u32, u32)) -> bool {
+    pub(crate) fn below(self, floor: (u32, u32, u32)) -> bool {
         match self {
             Self::Unknown => true,
             Self::Known(a, b, c) => (a, b, c) < floor,
@@ -43,7 +43,7 @@ impl Version {
     }
 
     /// How a warning and `--explain` name it.
-    pub fn text(self) -> String {
+    pub(crate) fn text(self) -> String {
         match self {
             Self::Known(a, b, c) => format!("{a}.{b}.{c}"),
             Self::Unknown => "unknown".to_owned(),

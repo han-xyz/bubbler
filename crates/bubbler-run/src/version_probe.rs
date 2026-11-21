@@ -11,7 +11,7 @@ use crate::version::{BWRAP_NAME, Version, parse};
 /// Ask `program` for its version. Nothing about the answer is trusted
 /// beyond its shape, and every failure is [`Version::Unknown`] rather
 /// than an error: a version check must never be what stops a run.
-pub fn probe(program: &Path, name: &str) -> Version {
+pub(crate) fn probe(program: &Path, name: &str) -> Version {
     // No stdin and no stderr: this runs before the descriptor sweep a
     // spawn makes, and the answer is one line on stdout.
     let Ok(out) = Command::new(program)
@@ -40,7 +40,7 @@ pub fn bwrap() -> Version {
 
 /// The host `xdg-dbus-proxy`'s version, asked for once per process. The
 /// binary is the one a run would start, `$BUBBLER_DBUS_PROXY` included.
-pub fn proxy(env: &Env) -> Version {
+pub(crate) fn proxy(env: &Env) -> Version {
     static SEEN: OnceLock<Version> = OnceLock::new();
     *SEEN.get_or_init(|| probe(&dbus::proxy_program(env), PROXY_BIN))
 }

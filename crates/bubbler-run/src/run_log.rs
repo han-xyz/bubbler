@@ -24,7 +24,7 @@ pub use crate::paths::{LOG_FILE, log_path as path};
 /// Most the log ever holds, the note below included. A cap and not a
 /// rotation: what a run said last is what a user is looking for, and one
 /// mebibyte of it is more than a launcher failure ever needs.
-pub const MAX_BYTES: u64 = 1 << 20;
+pub(crate) const MAX_BYTES: u64 = 1 << 20;
 
 // Kept free under [`MAX_BYTES`] by every writer but a start that ended
 // without binding, so that start's error is recorded even when the run
@@ -245,7 +245,7 @@ impl Drop for Redirect {
 /// The write end of a pipe whose every byte a thread copies to the stderr
 /// bubbler has now, for a sidecar's stderr: the sidecar parses what the
 /// sandbox sends it, so it is handed no terminal of the caller's.
-pub fn relay() -> Result<(OwnedFd, Relay), LaunchError> {
+pub(crate) fn relay() -> Result<(OwnedFd, Relay), LaunchError> {
     let (reader, writer) =
         rustix::pipe::pipe_with(PipeFlags::CLOEXEC).map_err(|e| LaunchError::Data(e.into()))?;
     let stderr = io::stderr()
@@ -271,7 +271,7 @@ pub fn relay() -> Result<(OwnedFd, Relay), LaunchError> {
 /// The copying thread of a [`relay`]. Dropped once the sidecar is gone, it
 /// waits up to a second for the last of its output.
 #[derive(Debug)]
-pub struct Relay {
+pub(crate) struct Relay {
     done: Receiver<()>,
 }
 

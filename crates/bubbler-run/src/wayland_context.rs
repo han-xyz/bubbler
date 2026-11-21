@@ -93,7 +93,7 @@ impl From<ConnectError> for WaylandError {
 
 /// Refuses an inherited compositor connection, given whatever
 /// `$WAYLAND_SOCKET` holds.
-pub fn refuse_inherited(socket: Option<&OsStr>) -> Result<(), WaylandError> {
+pub(crate) fn refuse_inherited(socket: Option<&OsStr>) -> Result<(), WaylandError> {
     match socket {
         Some(_) => Err(WaylandError::InheritedSocket),
         None => Ok(()),

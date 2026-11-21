@@ -92,7 +92,7 @@ pub const RESERVED_ENV: &[&str] = &[
 /// `/etc` entries `etc-share` may not name: the sandbox generates its own `passwd` and `group`,
 /// and binding the host's account files back in would undo that and leak the shadow hashes. The
 /// `-` and `+` forms are the backup and NIS-compatibility files next to them.
-pub const RESERVED_ETC: &[&str] = &[
+pub(crate) const RESERVED_ETC: &[&str] = &[
     "passwd", "passwd-", "passwd+", "group", "group-", "group+", "shadow", "shadow-", "shadow+",
     "gshadow", "gshadow-", "gshadow+",
 ];
@@ -140,7 +140,7 @@ pub struct TmpSize(pub u64);
 
 /// Largest `tmp size=` bubbler accepts: 64 GiB. A cap past this is a number nobody meant to
 /// write, and the pages behind it are the host's.
-pub const TMP_SIZE_MAX: u64 = 64 * 1024 * 1024 * 1024;
+pub(crate) const TMP_SIZE_MAX: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Whether the sandbox may create user namespaces of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -647,7 +647,7 @@ impl Portal {
 
     /// The child `name` names, if it is one. `camera` is deliberately not here: it parses to
     /// [`Service::Camera`].
-    pub fn from_name(name: &str) -> Option<Self> {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|p| p.node_name() == name)
     }
 }
@@ -2241,7 +2241,7 @@ fn parse_etc_share(node: &KdlNode) -> Result<Service, ConfigError> {
 /// A D-Bus well-known name: at least two `[A-Za-z_-][A-Za-z0-9_-]*`
 /// elements joined by `.`, where the last may be `*` to cover the name and
 /// every name below it.
-pub fn is_bus_name(s: &str) -> bool {
+pub(crate) fn is_bus_name(s: &str) -> bool {
     is_name_glob(s, 2)
 }
 

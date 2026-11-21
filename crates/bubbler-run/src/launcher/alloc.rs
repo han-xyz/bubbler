@@ -65,7 +65,7 @@ impl Drop for RealAlloc {
 impl RealAlloc {
     /// Allocate around an already inherited control socket fd. `dir` is the run's runtime
     /// directory, which the caller has created.
-    pub fn new(socket: RawFd, dir: PathBuf) -> Self {
+    pub(crate) fn new(socket: RawFd, dir: PathBuf) -> Self {
         let mut a = Self::in_dir(dir, "");
         a.socket = Some(socket);
         a
@@ -96,7 +96,7 @@ impl RealAlloc {
 
     /// Allocate for a sidecar that accepts on a socket bubbler has
     /// already bound and listened on, which it inherits by number.
-    pub fn sidecar_listening(listener: OwnedFd, dir: PathBuf) -> Self {
+    pub(crate) fn sidecar_listening(listener: OwnedFd, dir: PathBuf) -> Self {
         let mut a = Self::sidecar(dir);
         a.listen = Some(listener);
         a

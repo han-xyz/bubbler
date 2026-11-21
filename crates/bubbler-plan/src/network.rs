@@ -41,11 +41,11 @@ const DNS_PORT: u16 = 53;
 const FORWARD_ADDRESS: &str = "127.0.0.1";
 
 /// File name of the egress proxy binary.
-pub const NET_PROXY_NAME: &str = "bubbler-net-proxy";
+pub(crate) const NET_PROXY_NAME: &str = "bubbler-net-proxy";
 
 /// Where the egress proxy is installed, beside `bubbler-init` and the
 /// Wayland proxy.
-pub const NET_PROXY_INSTALLED: &str = "/usr/lib/bubbler/bubbler-net-proxy";
+pub(crate) const NET_PROXY_INSTALLED: &str = "/usr/lib/bubbler/bubbler-net-proxy";
 
 /// Host path of the egress proxy binary and where it was found:
 /// [`Env::net_proxy_override`] (`$BUBBLER_NET_PROXY`), else next to the
@@ -54,7 +54,7 @@ pub const NET_PROXY_INSTALLED: &str = "/usr/lib/bubbler/bubbler-net-proxy";
 /// The [`Found`] half is what says whether the binary has to be bound
 /// into the sandbox's mount namespace, which the proxy joins before it
 /// execs.
-pub fn net_proxy_program(env: &Env, host: &dyn Host) -> Result<(PathBuf, Found), PlanError> {
+pub(crate) fn net_proxy_program(env: &Env, host: &dyn Host) -> Result<(PathBuf, Found), PlanError> {
     init_bin::locate_binary(
         env.net_proxy_override.as_deref(),
         NET_PROXY_NAME,
@@ -131,7 +131,7 @@ const PROXY_BYPASS: &str = "localhost,127.0.0.1,::1";
 /// proxy listening on the namespace's own loopback at `port`, the
 /// loopback exemptions, and the one switch Node needs before its `fetch`
 /// reads any of them.
-pub fn proxy_env(port: u16) -> Vec<(String, String)> {
+pub(crate) fn proxy_env(port: u16) -> Vec<(String, String)> {
     let url = format!("http://127.0.0.1:{port}");
     PROXY_ENV_NAMES
         .iter()
@@ -150,7 +150,7 @@ pub fn proxy_env(port: u16) -> Vec<(String, String)> {
 ///
 /// Under `"host"` the host's file is right as it stands unless `dns`
 /// children replace it, and under `"none"` nothing is written at all.
-pub fn resolv_conf(cfg: &NetworkConfig) -> Option<Vec<u8>> {
+pub(crate) fn resolv_conf(cfg: &NetworkConfig) -> Option<Vec<u8>> {
     let mut out = String::new();
     for s in resolvers(cfg)? {
         out.push_str(&format!("nameserver {s}\n"));

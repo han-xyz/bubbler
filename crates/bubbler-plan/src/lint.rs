@@ -53,7 +53,7 @@ pub enum Where {
 impl Where {
     /// How a finding line starts: the path, or `built-in:<name>`. Not a
     /// `String`, because a profile path need not be UTF-8.
-    pub fn label(&self) -> OsString {
+    pub(crate) fn label(&self) -> OsString {
         match self {
             Self::File(p) => p.clone().into_os_string(),
             Self::BuiltIn(name) => OsString::from(format!("built-in:{name}")),
@@ -102,7 +102,7 @@ impl Report {
     /// Fold another report into this one, as `profile lint --all` does.
     /// Two profiles that `include` one base read that base twice, so both
     /// the layer and anything found in it are counted once.
-    pub fn absorb(&mut self, other: Report) {
+    pub(crate) fn absorb(&mut self, other: Report) {
         for layer in other.layers {
             if !self.layers.contains(&layer) {
                 self.layers.push(layer);
@@ -376,7 +376,7 @@ pub fn render_text(report: &Report) -> Vec<OsString> {
 }
 
 /// `N layers linted, E errors, W warnings, K notes`.
-pub fn summary(report: &Report) -> String {
+pub(crate) fn summary(report: &Report) -> String {
     format!(
         "{}, {}, {}, {}",
         plural(report.layers.len(), "layer linted", "layers linted"),

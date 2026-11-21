@@ -17,7 +17,7 @@ pub const PASTA_BIN: &str = "pasta";
 // Whether `name` is the shape `instance_ops::ephemeral` gives a throwaway
 // sandbox, `try-<pid>`, whose runtime directory is swept once that pid is
 // gone. An instance of that name would have its own swept out from under it.
-pub(crate) fn is_try_name(name: &str) -> bool {
+fn is_try_name(name: &str) -> bool {
     name.strip_prefix("try-")
         .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
 }

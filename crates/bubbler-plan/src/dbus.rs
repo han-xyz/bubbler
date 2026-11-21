@@ -26,7 +26,7 @@ pub const SYSTEM_NODE: &str = "system-bus";
 
 /// File name of the accessibility bus socket, in the same two
 /// directories.
-pub const A11Y_SOCKET: &str = "a11y";
+pub(crate) const A11Y_SOCKET: &str = "a11y";
 
 /// Config node that grants the accessibility bus, for errors about its
 /// socket.
@@ -62,7 +62,7 @@ const SESSION_PATH: &str = "/org/freedesktop/portal/desktop/session/*";
 /// notification, a print job, the read-only monitors a toolkit polls.
 // `Request` and `Session` are not here: their objects live under their
 // own subtrees, not at `DESKTOP_PATH`, so `portal_rules` gives them rules of their own.
-pub const PORTAL_SAFE: &[&str] = &[
+pub(crate) const PORTAL_SAFE: &[&str] = &[
     "FileChooser",
     "OpenURI",
     "Notification",
@@ -134,7 +134,7 @@ pub fn portal_rules(children: &[Portal]) -> Vec<String> {
 }
 
 /// What `camera` opens.
-pub fn camera_rules() -> [String; 2] {
+pub(crate) fn camera_rules() -> [String; 2] {
     [portal_call("Camera"), portal_broadcast("Camera")]
 }
 
@@ -585,7 +585,7 @@ pub fn proxy_command(
 /// [`proxy_command`] with the node behind each element: a rule carries
 /// the position in the config's `services` of the node that asked for it,
 /// and the proxy's own invocation carries none.
-pub fn proxy_command_nodes(
+pub(crate) fn proxy_command_nodes(
     program: &Path,
     plan: &Plan,
     buses: HostBuses<'_>,

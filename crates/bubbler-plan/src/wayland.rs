@@ -26,12 +26,12 @@ pub const SOCKET_NAME: &str = "wayland";
 pub const CONTEXT_SOCKET_NAME: &str = "wayland-context";
 
 /// File name of the proxy binary.
-pub const PROXY_NAME: &str = "bubbler-wl-proxy";
+pub(crate) const PROXY_NAME: &str = "bubbler-wl-proxy";
 
 /// Where the Wayland proxy is installed, beside `bubbler-init`. Not a
 /// `PATH` name like the D-Bus proxy's: the binary is bubbler's own, and
 /// a run must not pick up whatever else on a `PATH` answers to the name.
-pub const PROXY_BIN: &str = "/usr/lib/bubbler/bubbler-wl-proxy";
+pub(crate) const PROXY_BIN: &str = "/usr/lib/bubbler/bubbler-wl-proxy";
 
 // The proxy's own file rather than a copy kept in step by hand: a name
 // in one list and not the other would be a global core calls hidden and
@@ -43,7 +43,7 @@ include!("../../bubbler-wl-proxy/src/privileged.rs");
 /// running executable, else [`PROXY_BIN`]. A run cannot go on without
 /// one — the application would connect to a socket nothing accepts on —
 /// so a missing binary fails the launch rather than warning.
-pub fn locate_proxy(env: &Env, host: &dyn Host) -> Result<(PathBuf, Found), PlanError> {
+pub(crate) fn locate_proxy(env: &Env, host: &dyn Host) -> Result<(PathBuf, Found), PlanError> {
     init_bin::locate_binary(
         env.wl_proxy_override.as_deref(),
         PROXY_NAME,
@@ -55,7 +55,7 @@ pub fn locate_proxy(env: &Env, host: &dyn Host) -> Result<(PathBuf, Found), Plan
 
 /// Which Wayland socket a run binds into the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WaylandPlan {
+pub(crate) enum WaylandPlan {
     /// bubbler's own listening socket, which its Wayland proxy accepts
     /// the application on.
     Proxy {
@@ -115,7 +115,7 @@ impl ProxyPlan {
     }
 
     /// What the gate is called on the proxy's command line.
-    pub fn gate(&self) -> &'static str {
+    pub(crate) fn gate(&self) -> &'static str {
         match self.clipboard {
             Clipboard::Paste => "paste",
             Clipboard::Open => "open",
@@ -127,7 +127,7 @@ impl ProxyPlan {
     /// invocation itself. `listen_fd` numbers the listening socket the
     /// proxy adopts and accepts on, `ready_fd` the pipe it writes one
     /// byte to once it is listening.
-    pub fn command_nodes(
+    pub(crate) fn command_nodes(
         &self,
         program: &Path,
         node: usize,
@@ -173,7 +173,7 @@ pub fn context_socket_path(instance_runtime: &Path) -> PathBuf {
 /// compositor answered about `wp_security_context_manager_v1` does not
 /// enter into it: a sandboxed `wayland` connects to bubbler's proxy
 /// either way, and the answer decides only what the proxy connects to.
-pub fn plan(mode: WaylandMode, instance_runtime: &Path) -> WaylandPlan {
+pub(crate) fn plan(mode: WaylandMode, instance_runtime: &Path) -> WaylandPlan {
     match mode {
         WaylandMode::Host => WaylandPlan::Host,
         WaylandMode::Sandboxed { .. } => WaylandPlan::Proxy {

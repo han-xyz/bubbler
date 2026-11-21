@@ -587,7 +587,7 @@ pub mod test_support {
 
     /// A host with everything the origin tests grant: the stand-in
     /// supervisor, a home to share and `/etc/resolv.conf` for `network`.
-    pub fn share_host(tmp: &Path) -> crate::host::fake::FakeHost {
+    pub(crate) fn share_host(tmp: &Path) -> crate::host::fake::FakeHost {
         let (file, dir, _) = crate::host::fake::types();
         crate::host::fake::FakeHost::default()
             .with(&tmp.join("bubbler-init").display().to_string(), file)

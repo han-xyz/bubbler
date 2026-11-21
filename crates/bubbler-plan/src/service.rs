@@ -28,7 +28,7 @@ pub(crate) use dri::dri_binds_a_primary_node;
 
 /// What a service needs to know about the instance beyond its config.
 #[derive(Debug, Clone)]
-pub struct ServiceCtx<'a> {
+pub(crate) struct ServiceCtx<'a> {
     /// `$XDG_RUNTIME_DIR/bubbler/<instance>` on the host: where the
     /// launcher's sidecars put the sockets a service binds.
     pub instance_runtime: PathBuf,
@@ -48,7 +48,7 @@ pub struct ServiceCtx<'a> {
 /// its node in `services`. A [`Service::HomeShare`] `path` must be relative
 /// and a [`Service::PathShare`] `path` absolute, both normalised, exactly as
 /// the parser leaves them.
-pub fn apply_all(
+pub(crate) fn apply_all(
     services: &[Service],
     env: &Env,
     args: &mut BwrapArgs,
@@ -298,7 +298,7 @@ fn wayland(
 
 /// Display number from `$DISPLAY`: accepts `:N`, `:N.S`, `unix:N`.
 /// Anything with a host part is a TCP display and unsupported.
-pub fn x11_display_number(display: &OsStr) -> Option<u32> {
+pub(crate) fn x11_display_number(display: &OsStr) -> Option<u32> {
     let s = display.to_str()?;
     let rest = s.strip_prefix(':').or_else(|| s.strip_prefix("unix:"))?;
     let num = rest.split('.').next()?;
@@ -652,7 +652,7 @@ fn portals(
 /// refused here as well as in the parser, so a caller building an
 /// [`crate::config::InstanceConfig`] by hand cannot override what the
 /// sandbox sets.
-pub fn apply_env(pairs: &[(String, String)], args: &mut BwrapArgs) -> Result<(), PlanError> {
+pub(crate) fn apply_env(pairs: &[(String, String)], args: &mut BwrapArgs) -> Result<(), PlanError> {
     for (i, (k, v)) in pairs.iter().enumerate() {
         args.tag(Origin::Env(i));
         if RESERVED_ENV.contains(&k.as_str()) {
@@ -933,7 +933,7 @@ fn home_share(
 /// Bind every `--share` after the config's own services; the first directory
 /// becomes the working directory. A share the config already makes, one given
 /// twice, and one that contains or sits inside another share are errors.
-pub fn apply_shares(
+pub(crate) fn apply_shares(
     services: &[Service],
     shares: &[Share],
     env: &Env,

@@ -100,7 +100,7 @@ pub const INIT_INSIDE: &str = "/run/bubbler-init";
 /// in a sandbox that carries `/.flatpak-info`.
 // Not a free choice: gdk-pixbuf's glycin loaders run the program through
 // `env -i`, which leaves glibc's built-in path `/bin:/usr/bin` to find it.
-pub const FLATPAK_SPAWN_INSIDE: &str = "/usr/bin/flatpak-spawn";
+pub(crate) const FLATPAK_SPAWN_INSIDE: &str = "/usr/bin/flatpak-spawn";
 
 /// Turns generated content and channels into the fd numbers and host
 /// paths bwrap is told to read them from. `--dry-run` counts and names,
@@ -168,11 +168,11 @@ fn push<const N: usize>(v: &mut Vec<Item>, origin: Origin, parts: [&OsStr; N]) {
 
 /// Cap of the sandbox's `/tmp`, in bytes: 2 GiB. Without one a tmpfs may
 /// grow to half of host RAM (`tmpfs(5)`); `tmp size="…"` moves it.
-pub const TMP_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const TMP_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Cap of every other tmpfs bubbler mounts, in bytes: 64 MiB. The runtime
 /// directory `--dir` creates inside `/run` shares this cap.
-pub const TMPFS_SIZE: u64 = 64 * 1024 * 1024;
+pub(crate) const TMPFS_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Host `/etc` entries bound read-only when they exist. Everything else in
 /// `/etc` is hidden by the tmpfs mounted first.
@@ -205,11 +205,12 @@ pub const ETC_ALLOWLIST: &[&str] = &[
 
 /// Host `/etc` entries the D-Bus proxy sandbox gets when they exist:
 /// what the dynamic loader and name resolution read, and nothing else.
-pub const PROXY_ETC: &[&str] = &["ld.so.cache", "ld.so.conf", "ld.so.conf.d", "nsswitch.conf"];
+pub(crate) const PROXY_ETC: &[&str] =
+    &["ld.so.cache", "ld.so.conf", "ld.so.conf.d", "nsswitch.conf"];
 
 /// `/etc/passwd` for the sandbox: the fixed `bubbler` user plus `nobody`,
 /// which is what files owned by other host users map to in the user namespace.
-pub fn passwd_content(uid: u32, gid: u32) -> Vec<u8> {
+pub(crate) fn passwd_content(uid: u32, gid: u32) -> Vec<u8> {
     format!(
         "bubbler:x:{uid}:{gid}:bubbler:{SANDBOX_HOME}:/bin/sh\nnobody:x:65534:65534:nobody:/:/bin/sh\n"
     )
@@ -217,7 +218,7 @@ pub fn passwd_content(uid: u32, gid: u32) -> Vec<u8> {
 }
 
 /// `/etc/group` matching [`passwd_content`].
-pub fn group_content(gid: u32) -> Vec<u8> {
+pub(crate) fn group_content(gid: u32) -> Vec<u8> {
     format!("bubbler:x:{gid}:\nnobody:x:65534:\n").into_bytes()
 }
 
@@ -465,7 +466,7 @@ impl BwrapArgs {
     /// The PipeWire context sidecar's sandbox: the sidecar baseline, the
     /// session's `pipewire-0` read-only at its own path, and `dir` as `/tmp`,
     /// where `pw-container` creates its socket at a path it chooses itself.
-    pub fn pw_context_baseline(host_socket: &Path, dir: &Path, host: &dyn Host) -> Self {
+    pub(crate) fn pw_context_baseline(host_socket: &Path, dir: &Path, host: &dyn Host) -> Self {
         let mut a = Self::sidecar_baseline(host);
         let o = OsStr::new;
         let b = Origin::Baseline;
@@ -491,7 +492,12 @@ impl BwrapArgs {
     /// The sandbox of a `pulseaudio` grant's private server: the sidecar
     /// baseline, this run's context socket read-only at `inside`, and `dir` as
     /// `/tmp`. The session's own `pipewire-0` is not in here at all.
-    pub fn pw_pulse_baseline(socket: &Path, inside: &Path, dir: &Path, host: &dyn Host) -> Self {
+    pub(crate) fn pw_pulse_baseline(
+        socket: &Path,
+        inside: &Path,
+        dir: &Path,
+        host: &dyn Host,
+    ) -> Self {
         let mut a = Self::sidecar_baseline(host);
         let o = OsStr::new;
         let b = Origin::Baseline;
@@ -513,7 +519,7 @@ impl BwrapArgs {
     /// The Wayland proxy sidecar's sandbox: the sidecar baseline plus
     /// `upstream`, the compositor socket, read-only at its own path. The socket
     /// the proxy accepts the application on is handed over as a descriptor.
-    pub fn wl_proxy_baseline(upstream: &Path, host: &dyn Host) -> Self {
+    pub(crate) fn wl_proxy_baseline(upstream: &Path, host: &dyn Host) -> Self {
         let mut a = Self::sidecar_baseline(host);
         push(
             &mut a.skeleton,
@@ -551,7 +557,7 @@ impl BwrapArgs {
     ///
     /// If the arguments hold no `--chdir`; [`BwrapArgs::baseline`] always emits
     /// one.
-    pub fn chdir(&mut self, dir: &Path) {
+    pub(crate) fn chdir(&mut self, dir: &Path) {
         let flag = OsStr::new("--chdir");
         // Silently leaving the working directory where it was would put
         // the sandbox in whatever directory bwrap inherited — a host
@@ -577,7 +583,7 @@ impl BwrapArgs {
     ///
     /// If the arguments hold no `--size … --tmpfs /tmp`;
     /// [`BwrapArgs::baseline`] always emits one.
-    pub fn tmp_size(&mut self, bytes: u64) {
+    pub(crate) fn tmp_size(&mut self, bytes: u64) {
         let item = self
             .skeleton
             .iter_mut()
@@ -604,7 +610,7 @@ impl BwrapArgs {
     ///
     /// If the arguments hold no `--size … --tmpfs /etc` followed by two data
     /// binds.
-    pub fn bind_host_etc(&mut self, host: &dyn Host) {
+    pub(crate) fn bind_host_etc(&mut self, host: &dyn Host) {
         let start = self
             .skeleton
             .iter()
@@ -677,20 +683,20 @@ impl BwrapArgs {
     }
 
     /// Tag every argument pushed from here on with `origin`.
-    pub fn tag(&mut self, origin: Origin) {
+    pub(crate) fn tag(&mut self, origin: Origin) {
         self.origin = origin;
     }
 
     /// The tag in force, for a service that hands part of its work to
     /// another node's grant and has to put its own back afterwards.
-    pub fn origin(&self) -> Origin {
+    pub(crate) fn origin(&self) -> Origin {
         self.origin
     }
 
     /// Forbid nested user namespaces (`bwrap(1)` `--disable-userns`, phase 1).
     /// Idempotent, and it emits `--unshare-user` with the flag: bwrap refuses
     /// `--disable-userns` without it.
-    pub fn disable_userns(&mut self) {
+    pub(crate) fn disable_userns(&mut self) {
         let flags = [OsStr::new("--unshare-user"), OsStr::new("--disable-userns")];
         // The pair is one operation, and nothing else emits its head, so
         // `--unshare-user` there is what says it has already been added.
@@ -705,7 +711,7 @@ impl BwrapArgs {
     /// bubbler still has to publish waits, and it waits before it execs.
     // After `--info-fd`, which bwrap writes before it reads this one: the
     // identity is built out of that document.
-    pub fn block_until_released(&mut self) {
+    pub(crate) fn block_until_released(&mut self) {
         self.namespaces.push(Item {
             origin: self.origin,
             kind: Kind::BlockFd,
@@ -717,7 +723,7 @@ impl BwrapArgs {
     /// architecture and every error, so a sandbox needs exactly one call.
     // After `--info-fd` and `--block-fd` only for readability; bwrap orders
     // seccomp fds among themselves, not against other flags.
-    pub fn add_seccomp(&mut self, program: Vec<u8>, arches: &'static str) {
+    pub(crate) fn add_seccomp(&mut self, program: Vec<u8>, arches: &'static str) {
         self.namespaces.push(Item {
             origin: self.origin,
             kind: Kind::Seccomp { program, arches },
@@ -725,7 +731,7 @@ impl BwrapArgs {
     }
 
     /// Read-only bind of a host path (phase 4).
-    pub fn ro_bind(&mut self, src: &Path, dst: &Path) {
+    pub(crate) fn ro_bind(&mut self, src: &Path, dst: &Path) {
         push(
             &mut self.binds,
             self.origin,
@@ -735,7 +741,7 @@ impl BwrapArgs {
 
     /// Bind a host path "allowing device access" (`bwrap(1)` `--dev-bind`,
     /// phase 4). bwrap has no read-only form of it.
-    pub fn dev_bind(&mut self, src: &Path, dst: &Path) {
+    pub(crate) fn dev_bind(&mut self, src: &Path, dst: &Path) {
         push(
             &mut self.binds,
             self.origin,
@@ -747,7 +753,7 @@ impl BwrapArgs {
     /// has gone (`bwrap(1)` `--dev-bind-try`). For nodes enumerated while
     /// the argv is built: hardware unplugged in the moment between that and
     /// the exec must not fail the launch.
-    pub fn dev_bind_try(&mut self, src: &Path, dst: &Path) {
+    pub(crate) fn dev_bind_try(&mut self, src: &Path, dst: &Path) {
         push(
             &mut self.binds,
             self.origin,
@@ -760,7 +766,7 @@ impl BwrapArgs {
     }
 
     /// Symlink inside the sandbox (phase 4).
-    pub fn symlink(&mut self, target: &Path, link: &Path) {
+    pub(crate) fn symlink(&mut self, target: &Path, link: &Path) {
         push(
             &mut self.binds,
             self.origin,
@@ -775,7 +781,7 @@ impl BwrapArgs {
     /// Mask a directory with an empty read-only tmpfs, emitted after every bind
     /// of phase 4, whichever grant asked for it: a mask a later bind covers is
     /// no mask at all.
-    pub fn mask_dir(&mut self, dir: &Path) {
+    pub(crate) fn mask_dir(&mut self, dir: &Path) {
         push(
             &mut self.masks,
             self.origin,
@@ -794,7 +800,7 @@ impl BwrapArgs {
     }
 
     /// Read-write bind of a host path (phase 4).
-    pub fn bind(&mut self, src: &Path, dst: &Path) {
+    pub(crate) fn bind(&mut self, src: &Path, dst: &Path) {
         push(
             &mut self.binds,
             self.origin,
@@ -804,7 +810,7 @@ impl BwrapArgs {
 
     /// Bind the host `bubbler-init` binary read-only at [`INIT_INSIDE`]
     /// (phase 4), which is the program every sandbox actually starts.
-    pub fn bind_init(&mut self, host_path: &Path) {
+    pub(crate) fn bind_init(&mut self, host_path: &Path) {
         self.ro_bind(host_path, Path::new(INIT_INSIDE));
     }
 
@@ -812,7 +818,7 @@ impl BwrapArgs {
     /// [`FLATPAK_SPAWN_INSIDE`]. bwrap cannot create a mount point in the
     /// read-only `/usr`, so the bind goes into a tmpfs overlay of `/usr/bin`,
     /// which is remounted read-only after it. Needs unprivileged overlayfs.
-    pub fn flatpak_spawn_shim(&mut self, host_path: &Path) {
+    pub(crate) fn flatpak_spawn_shim(&mut self, host_path: &Path) {
         let o = OsStr::new;
         let bin = o("/usr/bin");
         // `--overlay-src` applies to the next overlay option only (`bwrap(1)`),
@@ -835,7 +841,7 @@ impl BwrapArgs {
 
     /// Bind `content` read-only at `dest` (phase 4). The bytes are handed
     /// to the allocator in `finish`, which writes them to a host file.
-    pub fn ro_bind_data(&mut self, content: Vec<u8>, dest: &Path) {
+    pub(crate) fn ro_bind_data(&mut self, content: Vec<u8>, dest: &Path) {
         self.binds.push(Item {
             origin: self.origin,
             kind: Kind::Data {
@@ -848,14 +854,14 @@ impl BwrapArgs {
     /// Let the command take its stdin as a controlling terminal: `--ctty`
     /// for the supervisor. Only for a pty bubbler allocated and handed to
     /// this sandbox, never for a terminal it inherited from the user.
-    pub fn ctty(&mut self) {
+    pub(crate) fn ctty(&mut self) {
         self.ctty = true;
     }
 
     /// Have the supervisor own the display socket and start `argv` on the first
     /// client that connects, with `wm` alongside it: `--x11 <argv…> --` and
     /// `--wm <program>` in `bubbler-init`'s own arguments.
-    pub fn x11_server(&mut self, argv: Vec<OsString>, wm: Option<OsString>) {
+    pub(crate) fn x11_server(&mut self, argv: Vec<OsString>, wm: Option<OsString>) {
         // Two servers in one sandbox is a bug in the caller: the second would
         // replace the first silently, so the first is kept.
         debug_assert!(self.x11.is_none(), "a second X server argv");
@@ -863,7 +869,7 @@ impl BwrapArgs {
     }
 
     /// Set a variable inside the sandbox (phase 5, after `--clearenv`).
-    pub fn setenv(&mut self, key: &OsStr, value: &OsStr) {
+    pub(crate) fn setenv(&mut self, key: &OsStr, value: &OsStr) {
         push(
             &mut self.env,
             self.origin,
@@ -1049,7 +1055,7 @@ impl BwrapArgs {
 }
 
 /// The argv again: the operations concatenated, element for element.
-pub fn flatten(items: Vec<Explained>) -> Vec<OsString> {
+pub(crate) fn flatten(items: Vec<Explained>) -> Vec<OsString> {
     items.into_iter().flat_map(|i| i.args).collect()
 }
 

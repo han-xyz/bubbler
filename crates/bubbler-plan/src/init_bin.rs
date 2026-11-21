@@ -14,7 +14,7 @@ use crate::service;
 pub use crate::names::INIT_BIN as NAME;
 
 /// Where a packaged bubbler installs the supervisor.
-pub const INSTALLED: &str = "/usr/lib/bubbler/bubbler-init";
+pub(crate) const INSTALLED: &str = "/usr/lib/bubbler/bubbler-init";
 
 /// Which of the three places a binary of bubbler's was found in.
 ///
@@ -65,7 +65,7 @@ pub fn locate_binary(
 /// else next to the running executable, else [`INSTALLED`]. Where it was
 /// found does not matter here — the supervisor is bound into every
 /// sandbox at [`crate::bwrap::INIT_INSIDE`] wherever it came from.
-pub fn locate(env: &Env, host: &dyn Host) -> Result<PathBuf, PlanError> {
+pub(crate) fn locate(env: &Env, host: &dyn Host) -> Result<PathBuf, PlanError> {
     locate_binary(env.init_override.as_deref(), NAME, INSTALLED, "init", host).map(|(p, _)| p)
 }
 

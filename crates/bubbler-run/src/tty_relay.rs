@@ -75,7 +75,7 @@ const ESCAPE: u8 = 0x1d;
 
 /// What the user is told when the detach sequence is typed. The sandbox
 /// keeps running either way; what ends is the relay.
-pub const DETACHED_NOTE: &str = "bubbler: detached; the sandbox keeps running";
+pub(crate) const DETACHED_NOTE: &str = "bubbler: detached; the sandbox keeps running";
 
 // How many `ESCAPE` bytes in a row detach, and how long that run may take.
 const DETACH_RUN: usize = 3;
@@ -91,7 +91,7 @@ pub fn host_is_tty() -> [bool; 3] {
 /// An open `/dev/null`: the stdio slot for something that must exist but
 /// carries nothing — a descriptor bubbler was started without, a sandbox
 /// asked for no terminal, or a pty whose output no fd of bubbler's can take.
-pub fn null_stdio() -> Result<OwnedFd, LaunchError> {
+pub(crate) fn null_stdio() -> Result<OwnedFd, LaunchError> {
     let path = Path::new("/dev/null");
     rustix::fs::open(path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
         .map_err(|e| LaunchError::Io(path.to_path_buf(), e.into()))
@@ -116,7 +116,7 @@ pub fn host_stdio() -> Result<[OwnedFd; 3], LaunchError> {
 /// the sandbox. `host_tty` must be a terminal, and not yet in raw mode.
 // After `RawGuard::new` this would hand the sandbox a raw pty instead,
 // with no echo and no line editing.
-pub fn allocate(host_tty: BorrowedFd<'_>) -> Result<Pty, LaunchError> {
+pub(crate) fn allocate(host_tty: BorrowedFd<'_>) -> Result<Pty, LaunchError> {
     let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
     let master = openpt(flags).map_err(pty_error)?;
     // A documented no-op on Linux, kept because it is the contract of /dev/ptmx.
@@ -135,7 +135,7 @@ pub fn allocate(host_tty: BorrowedFd<'_>) -> Result<Pty, LaunchError> {
 
 /// Raw mode on a terminal for as long as it lives. Restoring is what
 /// keeps a killed bubbler from leaving the user without an echo.
-pub struct RawGuard<'a> {
+pub(crate) struct RawGuard<'a> {
     fd: BorrowedFd<'a>,
     saved: Option<Termios>,
 }
@@ -143,7 +143,7 @@ pub struct RawGuard<'a> {
 impl<'a> RawGuard<'a> {
     /// Save `fd`'s settings and put it in raw mode. `fd` must be a
     /// terminal; anything else fails with `ENOTTY`.
-    pub fn new(fd: BorrowedFd<'a>) -> Result<Self, LaunchError> {
+    pub(crate) fn new(fd: BorrowedFd<'a>) -> Result<Self, LaunchError> {
         let saved = tcgetattr(fd).map_err(pty_error)?;
         let mut raw = saved.clone();
         raw.make_raw();
@@ -156,7 +156,7 @@ impl<'a> RawGuard<'a> {
 
     /// Restore the saved settings now. Idempotent, so the signal path can
     /// call it and the drop still runs.
-    pub fn restore(&mut self) {
+    pub(crate) fn restore(&mut self) {
         if let Some(saved) = self.saved.take() {
             // Flush, not Now: whatever the user typed after the sandbox
             // stopped reading is not fed to their shell.
@@ -173,7 +173,7 @@ impl Drop for RawGuard<'_> {
 
 /// How a relay ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelayEnd {
+pub(crate) enum RelayEnd {
     /// The command exited with this code, as `until` reported it.
     Exited(i32),
     /// The user typed the detach sequence; the sandbox keeps running.
@@ -510,7 +510,7 @@ impl<'a> Out<'a> {
 }
 
 /// What this run's signal handlers have caught, as the relay reads it.
-pub struct Caught<'a> {
+pub(crate) struct Caught<'a> {
     /// Set on `SIGWINCH` and cleared by the relay, which answers each
     /// one by copying the host terminal's size onto the pty.
     pub winch: &'a AtomicBool,
@@ -528,7 +528,7 @@ pub struct Caught<'a> {
 /// ([`null_stdio`]). What the pty still holds when the command's status
 /// arrives is read out too, and handed over before this returns unless
 /// `caught.stop` says the user is waiting for bubbler to be gone.
-pub fn relay(
+pub(crate) fn relay(
     master: BorrowedFd<'_>,
     host_in: Option<BorrowedFd<'_>>,
     host_out: BorrowedFd<'_>,
@@ -702,7 +702,7 @@ fn drain(master: BorrowedFd<'_>, out: &mut Out<'_>, mut reading: bool, stop: &At
 /// destination that stops taking output is replaced by `sink`. What the
 /// pipes hold when the status arrives is handed over as in the relay, and
 /// `stop` cuts that short the same way.
-pub fn pump(
+pub(crate) fn pump(
     pipes: &[(BorrowedFd<'_>, BorrowedFd<'_>, &str)],
     sink: BorrowedFd<'_>,
     until: &mut dyn FnMut() -> Option<i32>,
@@ -852,7 +852,7 @@ fn pty_error(e: Errno) -> LaunchError {
 /// 1, 2 and 0 the pty stands in for, so output still reaches the terminal
 /// when stdout alone is redirected. `None` when there is no pty, or when
 /// the only candidate is a terminal opened read-only.
-pub fn output_fd(plan: &StdioPlan, host: &[OwnedFd; 3]) -> Option<usize> {
+pub(crate) fn output_fd(plan: &StdioPlan, host: &[OwnedFd; 3]) -> Option<usize> {
     [1, 2, 0]
         .into_iter()
         .find(|i| plan.fds[*i] == StdioTarget::Slave && writable(host[*i].as_fd()))
@@ -860,7 +860,7 @@ pub fn output_fd(plan: &StdioPlan, host: &[OwnedFd; 3]) -> Option<usize> {
 
 // An fd whose access mode cannot be read is taken as unusable, which only
 // costs it its turn as the output.
-pub(crate) fn writable(fd: BorrowedFd<'_>) -> bool {
+fn writable(fd: BorrowedFd<'_>) -> bool {
     fcntl_getfl(fd).is_ok_and(|f| f & OFlags::ACCMODE != OFlags::RDONLY)
 }
 

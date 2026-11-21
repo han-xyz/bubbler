@@ -21,7 +21,7 @@ pub use crate::config::seccomp::{
 
 /// Denied with `EPERM` on top of [`DEFAULT_EPERM`], but only where the
 /// filter carries a single ABI.
-pub const SINGLE_ARCH_EPERM: &[&str] = &["modify_ldt"];
+pub(crate) const SINGLE_ARCH_EPERM: &[&str] = &["modify_ldt"];
 
 /// `ioctl` requests denied with `EPERM` by default, matched on the low 32
 /// bits of argument 1.
@@ -29,17 +29,18 @@ pub const DEFAULT_IOCTL_EPERM: &[u32] = &[TIOCSTI, TIOCLINUX];
 
 /// [`DEFAULT_IOCTL_EPERM`] with the name of each request, for
 /// `--explain`.
-pub const DEFAULT_IOCTL_NAMES: &[(u32, &str)] = &[(TIOCSTI, "TIOCSTI"), (TIOCLINUX, "TIOCLINUX")];
+pub(crate) const DEFAULT_IOCTL_NAMES: &[(u32, &str)] =
+    &[(TIOCSTI, "TIOCSTI"), (TIOCLINUX, "TIOCLINUX")];
 
 /// Pushes bytes into the controlling terminal's input queue, so a sandbox
 /// sharing the user's tty could type commands into their shell
 /// (CVE-2017-5226). Value from `asm-generic/ioctls.h`.
-pub const TIOCSTI: u32 = 0x5412;
+pub(crate) const TIOCSTI: u32 = 0x5412;
 
 /// Virtual console control, including the selection buffer, which is
 /// equivalent to [`TIOCSTI`] (CVE-2023-28100). Value from
 /// `asm-generic/ioctls.h`.
-pub const TIOCLINUX: u32 = 0x541C;
+pub(crate) const TIOCLINUX: u32 = 0x541C;
 
 // x32 is deliberately not among the extra architectures: it shares
 // x86_64's `AUDIT_ARCH` value, and libseccomp's own guard denies its
@@ -53,7 +54,7 @@ const EXTRA_ARCHES: &[ScmpArch] = &[];
 #[cfg(target_arch = "x86_64")]
 pub const ARCHES: &str = "x86_64 + i386";
 #[cfg(not(target_arch = "x86_64"))]
-pub const ARCHES: &str = std::env::consts::ARCH;
+pub(crate) const ARCHES: &str = std::env::consts::ARCH;
 
 /// One compiled filter and the architectures it answers for.
 #[derive(Debug, Clone, PartialEq, Eq)]

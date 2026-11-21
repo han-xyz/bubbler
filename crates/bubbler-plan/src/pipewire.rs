@@ -18,7 +18,7 @@ use crate::json;
 
 /// Engine name every context bubbler creates carries. The session
 /// manager's policy matches on it, exactly as it matches `org.flatpak`.
-pub const ENGINE: &str = "org.bubbler";
+pub(crate) const ENGINE: &str = "org.bubbler";
 
 // What `pipewire.access` is set to, which the daemon turns into
 // `pipewire.access.effective` on every client of the context.
@@ -35,13 +35,13 @@ pub const PW_CONTAINER: &str = "/usr/bin/pw-container";
 /// One word with no shell metacharacter in it, because `pw-container`
 /// hands its program to `system()`; `/run` rather than `/usr/lib`, for
 /// the same reason [`crate::bwrap::INIT_INSIDE`] is there.
-pub const HOLDER_INSIDE: &str = "/run/bubbler-pw-hold";
+pub(crate) const HOLDER_INSIDE: &str = "/run/bubbler-pw-hold";
 
 /// Names the descriptor the holder reports the socket's path on
 /// (`bubbler-init`'s `pw_hold::REPORT_FD`).
 /// `pw-container` drops every argv word after the program, so the
 /// environment is the only channel the holder has.
-pub const REPORT_FD: &str = "BUBBLER_PW_REPORT_FD";
+pub(crate) const REPORT_FD: &str = "BUBBLER_PW_REPORT_FD";
 
 /// The name a PipeWire client looks for under its runtime directory, and
 /// so the name the holder renames the context socket to.
@@ -81,7 +81,7 @@ pub const PULSE_DROP_IN: &str = "pipewire-pulse.conf.d/00-bubbler.conf";
 /// The config directory as the pulse sidecar sees it, which is what its
 /// `PIPEWIRE_CONFIG_DIR` names: [`pulse_config_dir`] under the `/tmp`
 /// that directory is bound as.
-pub const PULSE_CONFIG_INSIDE: &str = "/tmp/cfg";
+pub(crate) const PULSE_CONFIG_INSIDE: &str = "/tmp/cfg";
 
 /// The private pulse socket as that sidecar sees it, and so the address
 /// [`PULSE_OVERRIDE`] names.
@@ -102,7 +102,7 @@ pub const PULSE_ADOPTED: &str = "pulse-native";
 /// the sidecar has no runtime directory of the session's, and an
 /// absolute remote is taken as a path (measured: the private server
 /// arrives on the session daemon as a client of the context).
-pub const REMOTE_INSIDE: &str = "/run/pipewire-0";
+pub(crate) const REMOTE_INSIDE: &str = "/run/pipewire-0";
 
 /// The whole of what bubbler changes about the host's pulse
 /// configuration: the server listens on one socket of this run's own, a
@@ -150,7 +150,7 @@ pub fn dir(instance_runtime: &Path) -> PathBuf {
 /// never in it. The holder gives the socket its name in there and
 /// bubbler moves it here before anything binds it, so what bwrap
 /// resolves is a name the sidecar cannot reach.
-pub fn socket(instance_runtime: &Path) -> PathBuf {
+pub(crate) fn socket(instance_runtime: &Path) -> PathBuf {
     instance_runtime.join(SOCKET_NAME)
 }
 
@@ -175,7 +175,7 @@ pub fn pulse_socket_dir(instance_runtime: &Path) -> PathBuf {
 /// Host path of the private pulse socket the sandbox binds: beside
 /// [`pulse_dir`], never in it. bubbler moves it here before anything
 /// binds it, so what bwrap resolves is a name the server cannot swap.
-pub fn pulse_socket(instance_runtime: &Path) -> PathBuf {
+pub(crate) fn pulse_socket(instance_runtime: &Path) -> PathBuf {
     instance_runtime.join(PULSE_ADOPTED)
 }
 
@@ -213,7 +213,7 @@ pub fn pulse_conf(host: &dyn Host, config_home: &Path) -> Option<PathBuf> {
 /// The command the pulse sidecar runs. The config is named by file name
 /// and not by path: `PIPEWIRE_CONFIG_DIR` is what says which directory
 /// it is read from.
-pub fn pulse_command() -> Vec<OsString> {
+pub(crate) fn pulse_command() -> Vec<OsString> {
     [PIPEWIRE, "-c", PULSE_CONF]
         .into_iter()
         .map(OsString::from)
@@ -221,7 +221,7 @@ pub fn pulse_command() -> Vec<OsString> {
 }
 
 /// The grant set as the policy drop-in matches it.
-pub fn grant(audio: AudioSet) -> String {
+pub(crate) fn grant(audio: AudioSet) -> String {
     let children = [
         ("microphone", audio.microphone),
         ("devices", audio.devices),
@@ -245,7 +245,7 @@ pub fn grant(audio: AudioSet) -> String {
 /// would end a JSON string, this is the encoder and not the place to
 /// depend on that. The whole value is one argv element handed to bwrap,
 /// which no shell sees — only the program word is.
-pub fn properties(instance: &str, run_id: &str, audio: AudioSet) -> String {
+pub(crate) fn properties(instance: &str, run_id: &str, audio: AudioSet) -> String {
     let grant = grant(audio);
     let pairs = [
         ("pipewire.sec.engine", ENGINE),
@@ -265,7 +265,7 @@ pub fn properties(instance: &str, run_id: &str, audio: AudioSet) -> String {
 ///
 /// `--` before the program is not decoration: without it `pw-container`
 /// reads the program's own leading `-` words as its options.
-pub fn command(properties: &str) -> Vec<OsString> {
+pub(crate) fn command(properties: &str) -> Vec<OsString> {
     [PW_CONTAINER, "-P", properties, "--", HOLDER_INSIDE]
         .into_iter()
         .map(OsString::from)

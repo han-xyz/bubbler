@@ -19,13 +19,13 @@ use crate::error::DesktopError;
 /// only mark a user sees in a menu: an icon badge would mean shipping
 /// icon files and a theme cache, and every localized name carries this
 /// one, so the entry is marked in every locale rather than in English.
-pub const SUFFIX: &str = " (Bubbler)";
+pub(crate) const SUFFIX: &str = " (Bubbler)";
 
 /// Key naming the instance an entry was generated for. `X-` because a
 /// desktop entry may only be extended with `X-` keys, and the instance
 /// name because that is what makes `--remove` and a refusal to overwrite
 /// safe: an entry without it was written by somebody else.
-pub const MARKER: &str = "X-Bubbler-Instance";
+pub(crate) const MARKER: &str = "X-Bubbler-Instance";
 
 const APPLICATIONS: &str = "applications";
 
