@@ -16,7 +16,6 @@ use crate::bwrap::ETC_ALLOWLIST;
 use crate::config::{InstanceConfig, Service};
 use crate::dbus_wire::Value;
 use crate::env::{Env, SANDBOX_HOME};
-use crate::forward_register::Forward;
 use crate::host::Host;
 
 pub(crate) const DOC_DIR: &str = "doc";
@@ -26,6 +25,19 @@ pub(crate) const DOC_DIR: &str = "doc";
 const BASELINE_ROOTS: [&str; 2] = ["/usr", "/opt"];
 
 pub(crate) const REFUSED_ROOTS: [&str; 3] = ["/proc", "/sys", "/dev"];
+
+/// One file the portal exported, and where the sandbox will find it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forward {
+    /// Position of the argument to replace.
+    pub arg_index: usize,
+    /// The file on the host.
+    pub host: PathBuf,
+    /// `$XDG_RUNTIME_DIR/doc/<id>/<name>`, the path inside the sandbox.
+    pub inside: PathBuf,
+    /// Whether the sandbox was granted `write` as well as `read`.
+    pub write: bool,
+}
 
 /// A host file an argument names, worth asking the portal for.
 #[derive(Debug, Clone, PartialEq, Eq)]

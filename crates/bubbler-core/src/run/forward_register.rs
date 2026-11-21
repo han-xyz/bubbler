@@ -12,7 +12,7 @@ use rustix::fs::{Mode, OFlags};
 use crate::dbus_session::Session;
 use crate::dbus_wire::{Value, WireError};
 use crate::env::Env;
-use crate::forward::{Candidate, DOC_DIR, REFUSED_ROOTS, permission_sets, permissions};
+use crate::forward::{Candidate, DOC_DIR, Forward, REFUSED_ROOTS, permission_sets, permissions};
 
 const PORTAL_NAME: &str = "org.freedesktop.portal.Documents";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/documents";
@@ -24,19 +24,6 @@ const FLAG_REUSE_EXISTING: u32 = 1;
 // `sysfs`, as `statfs(2)` lists it. rustix names `PROC_SUPER_MAGIC`
 // but not this one.
 const SYSFS_MAGIC: rustix::fs::FsWord = 0x6265_6572;
-
-/// One file the portal exported, and where the sandbox will find it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Forward {
-    /// Position of the argument to replace.
-    pub arg_index: usize,
-    /// The file on the host.
-    pub host: PathBuf,
-    /// `$XDG_RUNTIME_DIR/doc/<id>/<name>`, the path inside the sandbox.
-    pub inside: PathBuf,
-    /// Whether the sandbox was granted `write` as well as `read`.
-    pub write: bool,
-}
 
 /// What kept one file from reaching the sandbox. Every variant leaves
 /// the argument as it was; forwarding is never a hard failure.
