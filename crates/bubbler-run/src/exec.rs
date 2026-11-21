@@ -26,25 +26,11 @@ use signal_hook::SigId;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 
 use crate::env::Env;
-use crate::launch_error::LaunchError;
+use crate::launch_error::{ControlError, LaunchError};
 use crate::tty::{self, StdioPlan, StdioTarget};
 use crate::tty_relay::{self, RawGuard, RelayEnd};
 
 pub use crate::paths::{SOCKET_NAME, socket_path};
-
-/// How the exec channel to a running instance failed.
-#[derive(Debug, thiserror::Error)]
-pub enum ControlError {
-    /// The instance hung up before it sent the command's status.
-    #[error("exec channel: the instance stopped while the command was running")]
-    Stopped,
-    /// Sending the request or reading the answer failed.
-    #[error("exec channel: {0}")]
-    Io(io::Error),
-    /// The channel closed with neither a status nor a stop signal.
-    #[error("exec channel: the instance sent no status for the command")]
-    NoStatus,
-}
 
 /// Connect to a live instance. `Ok(None)` when nothing listens. A refused
 /// socket is left over from a dead run and is left where it is: only a

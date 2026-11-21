@@ -96,7 +96,7 @@ pub struct View<'a> {
     /// [`crate::audio_policy::explain_suffix`], asked by the caller as `bwrap` below is: an
     /// explanation describes a run and does not probe the host itself.
     pub audio_policy: &'a str,
-    /// bubbler's own cgroup, as `crate::cgroup::own_path` reads it, which an `allow-host`
+    /// bubbler's own cgroup, as `bubbler_run::cgroup::own_path` reads it, which an `allow-host`
     /// ruleset's placeholder cgroup is named under; `None` where the host will not answer.
     /// Asked by the caller for the same reason as `audio_policy`.
     pub own_cgroup: Option<&'a str>,

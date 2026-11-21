@@ -11,8 +11,7 @@ use rustix::io::Errno;
 
 use thiserror::Error;
 
-use crate::dbus_a11y::A11yError;
-use crate::exec::ControlError;
+use crate::dbus_wire::WireError;
 use crate::wayland_context::WaylandError;
 use bubbler_model::error::ConfigError;
 use bubbler_plan::plan_error::PlanError;
@@ -270,6 +269,87 @@ pub enum NetworkError {
          which is what an `allow-host` ruleset matches on"
     )]
     NoCgroup2,
+}
+
+/// Why the accessibility bus could not be found: `$AT_SPI_BUS_ADDRESS`
+/// named no socket bubbler can bind, the session bus could not be
+/// reached, or `org.a11y.Bus` did not answer with a `unix:path=` address.
+/// Text the bus sent is shown through `bus_note`; the address it
+/// answered with is never echoed, as it is host input.
+#[derive(Debug, thiserror::Error)]
+pub enum A11yError {
+    /// `GetAddress` answered with something other than one string.
+    #[error("finding the accessibility bus: org.a11y.Bus answered GetAddress with no address")]
+    NoAddress,
+    /// The answer is no `unix:path=` address.
+    #[error(
+        "finding the accessibility bus: the address org.a11y.Bus returned is not a \
+         `unix:path=<path>` socket"
+    )]
+    NoPath,
+    /// The answer's `unix:path=` holds a malformed `%XX` escape.
+    #[error(
+        "finding the accessibility bus: the address org.a11y.Bus returned has a bad `%XX` \
+         escape in its `unix:path=`"
+    )]
+    BadEscape,
+    /// `GetAddress` was refused with a D-Bus error and no text. The
+    /// name is the half that matters, and a trailing colon would promise
+    /// a sentence that is not there.
+    #[error("finding the accessibility bus: org.a11y.Bus.GetAddress failed: {}", bus_note(.name))]
+    Refused {
+        /// The D-Bus error name.
+        name: String,
+    },
+    /// `GetAddress` was refused with a D-Bus error and its text.
+    #[error(
+        "finding the accessibility bus: org.a11y.Bus.GetAddress failed: {}: {}",
+        bus_note(.name),
+        bus_note(.message)
+    )]
+    RefusedWithMessage {
+        /// The D-Bus error name.
+        name: String,
+        /// The text the error came with.
+        message: String,
+    },
+    /// The session bus could not be asked at all.
+    #[error(
+        "finding the accessibility bus: asking the session bus for the accessibility bus: {}",
+        bus_note(&.0.to_string())
+    )]
+    Session(WireError),
+}
+
+/// How the exec channel to a running instance failed.
+#[derive(Debug, thiserror::Error)]
+pub enum ControlError {
+    /// The instance hung up before it sent the command's status.
+    #[error("exec channel: the instance stopped while the command was running")]
+    Stopped,
+    /// Sending the request or reading the answer failed.
+    #[error("exec channel: {0}")]
+    Io(io::Error),
+    /// The channel closed with neither a status nor a stop signal.
+    #[error("exec channel: the instance sent no status for the command")]
+    NoStatus,
+}
+
+// Text bubbler did not write: the first line of it, with the control characters
+// shown rather than sent to whatever terminal reads the message.
+fn bus_note(text: &str) -> String {
+    // A D-Bus error name and its text fit; a peer with more to say does not get
+    // to fill the terminal with it.
+    const KEPT: usize = 200;
+
+    let line = text.split('\n').next().unwrap_or_default();
+    let rendered = String::from_utf8(crate::safe_text::render(line.as_bytes()))
+        .expect("the rendering escapes every byte that is not text");
+    let text = rendered.trim();
+    match text.char_indices().nth(KEPT) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text.to_owned(),
+    }
 }
 
 #[cfg(test)]

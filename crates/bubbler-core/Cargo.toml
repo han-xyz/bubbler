@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Library core of bubbler: config model, services, bwrap argument builder, launcher"
+description = "Facade of bubbler: re-exports bubbler-model, bubbler-plan and bubbler-run at one path"
 
 [dependencies]
 bubbler-model.workspace = true

@@ -1,5 +1,5 @@
 //! Where a sandbox's Wayland socket goes and how the proxy sidecar is
-//! started: the plan `crate::wayland_context` carries out against
+//! started: the plan `bubbler_run::wayland_context` carries out against
 //! the compositor through `wp_security_context_v1`.
 
 use std::ffi::{OsStr, OsString};

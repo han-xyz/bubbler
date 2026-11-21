@@ -1,7 +1,7 @@
 //! Core of bubbler: turns an instance configuration into a bubblewrap
 //! invocation. Nothing in this crate knows about the CLI.
 
-/// Every error type at the path it had before the layers split.
+/// Every error type of the model, plan and run layers at one path.
 pub mod error {
     pub use bubbler_model::error::*;
     pub use bubbler_plan::plan_error::PlanError;
