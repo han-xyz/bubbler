@@ -38,7 +38,10 @@ const DEBT: &[Entry] = &[
 
 const TEST_DEBT: &[Entry] = &[
     ("bwrap", "launcher", "plan/bwrap.rs:1167"),
+    ("config", "network", "model/config.rs:4292"),
+    ("dbus", "dbus_wire", "plan/dbus.rs:829"),
     ("explain", "audio_policy", "plan/explain.rs:1252"),
+    ("explain", "version", "plan/explain.rs:850"),
     ("profile", "audio_policy", "model/profile.rs:1625"),
     ("profile", "bwrap", "model/profile.rs:3174"),
     ("profile", "explain", "model/profile.rs:3194"),
@@ -73,6 +76,7 @@ fn upward_edges_are_exactly_the_recorded_debt() {
     let mut problems = Vec::new();
     for (rel, text) in &files {
         if is_exempt(rel) {
+            problems.extend(root_file_problems(rel, text));
             continue;
         }
         match edges_in(rel, text, &modules) {
@@ -98,6 +102,23 @@ fn source_files(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
 
 fn is_exempt(rel: &str) -> bool {
     rel == "lib.rs" || LAYERS.iter().any(|l| rel == format!("{l}/mod.rs"))
+}
+
+/// lib.rs re-exports whatever it likes; a layer's mod.rs only declares
+/// the layer's modules, so a `crate::` path there would be an edge the
+/// scan does not see.
+fn root_file_problems(rel: &str, text: &str) -> Vec<String> {
+    if rel == "lib.rs" {
+        return Vec::new();
+    }
+    let code = strip(text);
+    crate_refs(&code)
+        .into_iter()
+        .map(|(pos, _)| {
+            let line = code[..pos].matches('\n').count() + 1;
+            format!("{rel}:{line}: a layer's mod.rs holds only `pub mod` lines")
+        })
+        .collect()
 }
 
 /// `model/config.rs` and `plan/service/dri.rs` belong to the modules
@@ -176,15 +197,13 @@ fn debt_problems(
     let mut reported = BTreeSet::new();
     for e in &upward {
         let pair = (e.from.as_str(), e.to.as_str());
-        let missing = if e.test {
-            !production.contains(&pair) && !listed(test_debt, pair) && !listed(debt, pair)
-        } else {
-            !listed(debt, pair)
+        let (table, name) = match e.test {
+            true => (test_debt, "TEST_DEBT"),
+            false => (debt, "DEBT"),
         };
-        if missing && reported.insert((pair, e.test)) {
-            let table = if e.test { "TEST_DEBT" } else { "DEBT" };
+        if !listed(table, pair) && reported.insert((pair, e.test)) {
             problems.push(format!(
-                "upward edge in neither table, belongs in {table}: (\"{}\", \"{}\", \"{}\"),",
+                "upward edge not in {name}: (\"{}\", \"{}\", \"{}\"),",
                 e.from, e.to, e.at
             ));
         }
@@ -528,6 +547,43 @@ mod scanner {
         assert_eq!(
             problems,
             ["(config, launcher, model/config.rs:1) no longer occurs: remove it from DEBT"]
+        );
+    }
+
+    #[test]
+    fn test_code_is_held_to_test_debt_even_when_production_has_the_edge() {
+        let code = "fn prod() { crate::launcher::y(); }\n#[cfg(test)]\nmod t { use crate::launcher::x; }\n";
+        let edges = edges_in("plan/bwrap.rs", code, &modules()).unwrap();
+        let problems = debt_problems(
+            &edges,
+            &modules(),
+            &[("bwrap", "launcher", "plan/bwrap.rs:1")],
+            &[("config", "launcher", "model/config.rs:9")],
+        );
+        assert_eq!(
+            problems,
+            [
+                "upward edge not in TEST_DEBT: (\"bwrap\", \"launcher\", \"plan/bwrap.rs:3\"),",
+                "(config, launcher, model/config.rs:9) no longer occurs: remove it from TEST_DEBT",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_crate_path_in_a_layer_mod_rs_fails() {
+        assert_eq!(
+            root_file_problems(
+                "plan/mod.rs",
+                "pub mod bwrap;\npub use crate::run::launcher;\n"
+            ),
+            ["plan/mod.rs:2: a layer's mod.rs holds only `pub mod` lines"]
+        );
+        assert!(
+            root_file_problems(
+                "lib.rs",
+                "pub use run::launcher;\npub use crate::run::tty;\n"
+            )
+            .is_empty()
         );
     }
 }
