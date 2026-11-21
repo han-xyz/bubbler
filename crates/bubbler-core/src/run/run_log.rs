@@ -393,9 +393,9 @@ fn append_capped(
     Ok(())
 }
 
-/// Held by every test that points fd 2 at a log: the descriptor is the
-/// whole test binary's, and two redirects at once would each put back the
-/// other's pipe.
+/// Held by every test that points fd 2 elsewhere, at a log or not: the
+/// descriptor is the whole test binary's, and two such tests at once would
+/// each put back the other's.
 #[cfg(test)]
 pub(crate) static FD2: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

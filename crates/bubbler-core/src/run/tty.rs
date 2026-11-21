@@ -977,7 +977,7 @@ mod tests {
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+    use std::sync::{Arc, MutexGuard, PoisonError};
     use std::thread::{self, JoinHandle};
 
     use rustix::termios::{OutputModes, Winsize};
@@ -1084,11 +1084,6 @@ mod tests {
         finish_within(r, Duration::from_secs(5))
     }
 
-    /// Held while fd 2 is not what it was, so two tests moving it at once
-    /// cannot restore each other's and swallow the rest of the run's
-    /// output.
-    static QUIET: Mutex<()> = Mutex::new(());
-
     /// Point fd 2 somewhere else while the guard lives, and put it back
     /// afterwards. Several tests make the relay report a destination that
     /// refuses its output, and that warning is the expected result, not
@@ -1103,7 +1098,9 @@ mod tests {
         fn at(fd: OwnedFd) -> Self {
             // A poisoned lock only means such a test panicked, and its
             // guard put fd 2 back on the way out.
-            let lock = QUIET.lock().unwrap_or_else(PoisonError::into_inner);
+            let lock = crate::run_log::FD2
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             let saved = std::io::stderr()
                 .as_fd()
                 .try_clone_to_owned()
