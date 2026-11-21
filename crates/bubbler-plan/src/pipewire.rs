@@ -54,7 +54,7 @@ pub const SOCKET_INSIDE: &str = "/tmp/pipewire-0";
 
 /// What an explanation shows in place of the run id, which is only known
 /// once there is a run.
-pub const RUN_ID_SHOWN: &str = "<run id>";
+pub(crate) const RUN_ID_SHOWN: &str = "<run id>";
 
 /// The daemon binary the private PulseAudio server of a `pulseaudio`
 /// grant is one configuration of: the same `pipewire` that serves the
@@ -126,7 +126,7 @@ pub struct Context<'a> {
     pub instance_runtime: &'a Path,
     /// The instance's name, which the context carries as its `app-id`.
     pub instance: &'a str,
-    /// What tells two runs of one instance apart, or [`RUN_ID_SHOWN`]
+    /// What tells two runs of one instance apart, or `RUN_ID_SHOWN`
     /// where there is no run to identify yet.
     pub run_id: &'a str,
     /// The grant set the session manager's policy is to apply.

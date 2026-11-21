@@ -34,7 +34,7 @@ const PROXY_STOP: Duration = Duration::from_secs(1);
 /// A running D-Bus proxy sidecar. Dropping it closes the ready pipe, which is what makes
 /// `xdg-dbus-proxy` exit, so it must outlive the sandbox using the socket.
 #[derive(Debug)]
-pub struct ProxyHandle {
+pub(crate) struct ProxyHandle {
     pub(super) child: Child,
     pub(super) alloc: RealAlloc,
     pub(super) socket_dir: PathBuf,
@@ -114,7 +114,7 @@ pub(super) fn still_running(child: &mut Child) -> bool {
 
 /// Start an instance's filtering D-Bus proxy in its own sandbox and wait until its socket
 /// exists. The handle must outlive the sandbox.
-pub fn start_proxy(
+pub(crate) fn start_proxy(
     env: &Env,
     dir: &Path,
     plan: &dbus::Plan,

@@ -2,7 +2,7 @@
 //! `wp_security_context_v1` (wayland-protocols staging,
 //! `security-context-v1.xml`).
 //!
-//! [`probe`] and [`create_context`] connect over `$WAYLAND_DISPLAY` in
+//! [`probe`] and `create_context` connect over `$WAYLAND_DISPLAY` in
 //! `$XDG_RUNTIME_DIR`, which wayrs reads from the process environment
 //! itself. Nothing here can check that value, so the launcher validates
 //! its shape — one path component — before calling in.
@@ -38,7 +38,7 @@ pub enum WaylandError {
     },
     /// The compositor does not implement the protocol. Not an error on
     /// its own — the launcher falls back to the session socket — but
-    /// [`create_context`] reports it, since by then the global was
+    /// `create_context` reports it, since by then the global was
     /// expected to be there.
     #[error("the compositor offers no wp_security_context_manager_v1")]
     NoManager,
@@ -121,7 +121,7 @@ pub fn probe() -> Result<bool, WaylandError> {
 /// on it after this call returns and bubbler's connection is dropped,
 /// until `close_fd` signals hangup — the caller holds its write end for
 /// as long as the sandbox may connect.
-pub fn create_context(
+pub(crate) fn create_context(
     listener: OwnedFd,
     close_fd: OwnedFd,
     app_id: &str,

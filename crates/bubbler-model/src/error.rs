@@ -58,7 +58,7 @@ pub enum ConfigError {
         /// The bound it passed, [`crate::config::MAX_NESTING`].
         max: usize,
     },
-    /// A `/*` with more than [`crate::config::MAX_COMMENT_MARKS`] `*` or
+    /// A `/*` with more than `crate::config::MAX_COMMENT_MARKS` `*` or
     /// `/` in the comment after it, measured wherever the `/*` stands —
     /// inside a string too.
     #[error(
@@ -67,11 +67,11 @@ pub enum ConfigError {
     CommentTooBusy {
         /// Line the `/*` is on, counting from one.
         line: u32,
-        /// The bound it passed, [`crate::config::MAX_COMMENT_MARKS`].
+        /// The bound it passed, `crate::config::MAX_COMMENT_MARKS`.
         max: usize,
     },
     /// The thread the parser runs on, with the stack
-    /// [`crate::config::PARSER_STACK`] reserves, could not be started.
+    /// `crate::config::PARSER_STACK` reserves, could not be started.
     #[error("cannot start the parser thread")]
     ParserThread(#[source] io::Error),
     /// The parser panicked, and the panic was caught at the thread it

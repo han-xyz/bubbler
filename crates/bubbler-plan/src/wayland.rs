@@ -17,13 +17,13 @@ pub const ENGINE: &str = "org.bubbler";
 
 /// File name of the socket the application connects to, under the
 /// instance's runtime directory.
-pub const SOCKET_NAME: &str = "wayland";
+pub(crate) const SOCKET_NAME: &str = "wayland";
 
 /// File name of the socket the compositor accepts on as this run's
 /// security context, beside [`SOCKET_NAME`]. Only the proxy connects to
 /// it: the application reaches the compositor through the proxy, which
 /// is where the clipboard gate applies.
-pub const CONTEXT_SOCKET_NAME: &str = "wayland-context";
+pub(crate) const CONTEXT_SOCKET_NAME: &str = "wayland-context";
 
 /// File name of the proxy binary.
 pub(crate) const PROXY_NAME: &str = "bubbler-wl-proxy";
@@ -88,7 +88,7 @@ pub struct ProxyPlan {
 
 impl ProxyPlan {
     /// The plan for a compositor that took the security context: the
-    /// proxy connects to [`CONTEXT_SOCKET_NAME`], which the compositor
+    /// proxy connects to `CONTEXT_SOCKET_NAME`, which the compositor
     /// accepts on, and the compositor withholds the privileged globals
     /// by itself.
     pub fn context(instance_runtime: &Path, clipboard: Clipboard) -> Self {
@@ -156,14 +156,14 @@ impl ProxyPlan {
     }
 }
 
-/// Where a run's own listening socket goes: [`SOCKET_NAME`] under the
+/// Where a run's own listening socket goes: `SOCKET_NAME` under the
 /// instance's runtime directory, which only bubbler can write to.
 pub fn socket_path(instance_runtime: &Path) -> PathBuf {
     instance_runtime.join(SOCKET_NAME)
 }
 
 /// Where the socket the compositor accepts on goes:
-/// [`CONTEXT_SOCKET_NAME`] beside [`socket_path`], in the same
+/// `CONTEXT_SOCKET_NAME` beside [`socket_path`], in the same
 /// directory only bubbler can write to.
 pub fn context_socket_path(instance_runtime: &Path) -> PathBuf {
     instance_runtime.join(CONTEXT_SOCKET_NAME)

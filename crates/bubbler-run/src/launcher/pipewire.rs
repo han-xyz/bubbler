@@ -40,7 +40,7 @@ const PW_REPORT_MAX: usize = 4096;
 /// A run's PipeWire security context and its sidecar. `pw-container` tears the context down when
 /// its program exits, so dropping this ends it; it must outlive the sandbox.
 #[derive(Debug)]
-pub struct PwHandle {
+pub(crate) struct PwHandle {
     pub(super) child: Child,
     pub(super) alloc: RealAlloc,
     // `pw-container` unlinks the name it chose, which the holder renamed away, so what is left
@@ -82,7 +82,7 @@ impl Drop for PwHandle {
 
 /// Create this run's PipeWire security context and wait for its socket, which bwrap then binds.
 /// `Ok(None)` where no audio is granted. The handle must outlive the sandbox.
-pub fn start_pw_context(
+pub(crate) fn start_pw_context(
     env: &Env,
     dir: &Path,
     inst: &Instance,
@@ -259,7 +259,7 @@ pub(super) fn adopt_socket(
 /// A run's private PulseAudio server sidecar. Dropping it stops the server, so it must outlive
 /// the sandbox, and it drops before [`PwHandle`], whose context it is a client of.
 #[derive(Debug)]
-pub struct PulseHandle {
+pub(crate) struct PulseHandle {
     pub(super) child: Child,
     pub(super) alloc: RealAlloc,
     pub(super) dir: PathBuf,
@@ -297,7 +297,7 @@ impl Drop for PulseHandle {
 
 /// Start this run's private PulseAudio server, a client of [`start_pw_context`]'s context, and
 /// wait for its socket. `Ok(None)` without `pulseaudio`. The handle must outlive the sandbox.
-pub fn start_pw_pulse(
+pub(crate) fn start_pw_pulse(
     env: &Env,
     dir: &Path,
     inst: &Instance,

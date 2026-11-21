@@ -126,12 +126,14 @@ pub struct Cidr {
 impl Cidr {
     /// The address, which is the network address where the prefix covers
     /// more than one.
-    pub fn addr(&self) -> IpAddr {
+    #[cfg(test)]
+    pub(crate) fn addr(&self) -> IpAddr {
         self.addr
     }
 
     /// How many leading bits of [`Cidr::addr`] the rule matches on.
-    pub fn prefix(&self) -> u8 {
+    #[cfg(test)]
+    pub(crate) fn prefix(&self) -> u8 {
         self.prefix
     }
 

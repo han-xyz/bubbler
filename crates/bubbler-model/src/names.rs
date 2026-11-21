@@ -26,7 +26,7 @@ fn is_try_name(name: &str) -> bool {
 /// `.` or `..`, and not starting with `-`. Such a name is one path
 /// component that cannot traverse out of a directory, and no CLI that
 /// takes it reads it as an option.
-pub fn is_plain_name(name: &str) -> bool {
+pub(crate) fn is_plain_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."

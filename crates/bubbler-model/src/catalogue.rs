@@ -33,7 +33,7 @@ impl fmt::Display for Risk {
 /// One config node as a reader needs it explained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Grant {
-    /// The KDL node name, as [`crate::config::NODES`] holds it and
+    /// The KDL node name, as `crate::config::NODES` holds it and
     /// [`crate::config::Service::node_name`] returns it.
     pub node: &'static str,
     /// One line, present tense: what the sandbox gets.
@@ -47,7 +47,7 @@ pub struct Grant {
     pub grammar: &'static str,
 }
 
-/// Every node a config may hold, in the order [`crate::config::NODES`]
+/// Every node a config may hold, in the order `crate::config::NODES`
 /// lists them, which is the order the README documents them in.
 pub static GRANTS: &[Grant] = &[
     Grant {
@@ -441,7 +441,7 @@ pub static GRANTS: &[Grant] = &[
 /// Service names `instance_ops::ephemeral` accepts as grants: the bare
 /// config nodes, which take no arguments. Anything else needs a config
 /// file and therefore a real instance.
-pub const BARE_GRANTS: &[&str] = &[
+pub(crate) const BARE_GRANTS: &[&str] = &[
     "wayland",
     "x11",
     "network",

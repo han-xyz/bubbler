@@ -33,7 +33,7 @@ const WL_PROXY_STOP: Duration = Duration::from_secs(5);
 /// one, the security context. Dropping it stops the proxy and ends the context, so it must
 /// outlive the sandbox.
 #[derive(Debug)]
-pub struct WaylandHandle {
+pub(crate) struct WaylandHandle {
     child: Child,
     alloc: RealAlloc,
     // The compositor's `close_fd`; `None` where it offers no security context.
@@ -73,7 +73,7 @@ impl Drop for WaylandHandle {
 /// Bind the socket this run's application connects to and start `bubbler-wl-proxy` behind it,
 /// through a security context where the compositor has one. `Ok(None)` only for `wayland
 /// "host"`. The handle must outlive the sandbox.
-pub fn start_wayland(
+pub(crate) fn start_wayland(
     env: &Env,
     dir: &Path,
     inst: &Instance,

@@ -1,5 +1,5 @@
 //! The document-portal call that hands the sandbox the files
-//! [`crate::forward::plan`] picked: one `AddFull` per permission set.
+//! [`crate::forward::plan_args`] picked: one `AddFull` per permission set.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -40,12 +40,12 @@ pub enum ForwardError {
     },
     /// The opened descriptor is not a regular file. The type is checked
     /// again on the descriptor, so a path that changed under us between
-    /// [`plan`](crate::forward::plan) and the open cannot smuggle a directory to the portal.
+    /// [`plan_args`](crate::forward::plan_args) and the open cannot smuggle a directory to the portal.
     #[error("{} is not a regular file", .0.display())]
     NotAFile(PathBuf),
     /// The descriptor turned out to name a path under `/proc`, `/sys`
     /// or `/dev`. Those `fstat` as regular files, so the check that
-    /// [`plan`](crate::forward::plan) made on the path is made again on what was opened.
+    /// [`plan_args`](crate::forward::plan_args) made on the path is made again on what was opened.
     #[error("{} names {} now, which is under /proc, /sys or /dev", .path.display(), .real.display())]
     Refused {
         /// File the argument named.

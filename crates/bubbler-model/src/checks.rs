@@ -5,7 +5,7 @@ use std::fmt;
 
 /// The `lint-allow` id that accepts two instances sharing a portal app id,
 /// and the lint check that reports it.
-pub const APP_ID_SHARED_CHECK: &str = "app-id-shared";
+pub(crate) const APP_ID_SHARED_CHECK: &str = "app-id-shared";
 
 /// The `lint-allow` id that accepts an installed policy file differing
 /// from this binary's: a copy edited on purpose. The same id names the

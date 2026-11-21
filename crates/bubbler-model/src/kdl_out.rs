@@ -36,7 +36,7 @@ pub fn render(cfg: &InstanceConfig) -> Result<String, ConfigError> {
 /// The nodes of `cfg` as separate strings, so a caller can pair each with
 /// where it came from. A block node is one multi-line string, and a
 /// disabled entry is one node on its `/-` line.
-pub fn nodes(cfg: &InstanceConfig) -> Result<Vec<String>, ConfigError> {
+pub(crate) fn nodes(cfg: &InstanceConfig) -> Result<Vec<String>, ConfigError> {
     let mut out = Vec::new();
     // Ahead of the grants: a finding the file has accepted is about the file, and reading it first
     // says what the nodes below were allowed to be.
@@ -135,7 +135,7 @@ pub enum Entry<'a, T> {
 /// One section of the file: its `enabled` nodes with the disabled entries of the same section among
 /// them, each before the entry it was read above. An entry pointing past the last one comes after
 /// it rather than being dropped: the section may have lost the node it sat above since. Both
-/// readers of a section — [`nodes`] below and the editor's row list — walk this, so a file and the
+/// readers of a section — `nodes` below and the editor's row list — walk this, so a file and the
 /// editor's view of it cannot disagree about where a `/-` line sits.
 pub fn section_entries<'a, T>(
     cfg: &'a InstanceConfig,
@@ -177,7 +177,7 @@ fn section(
 
 /// One parsed node as the KDL line it was read from. A node is one line,
 /// or one block: what the emitter writes here is what
-/// [`crate::config::NODES`] takes back.
+/// `crate::config::NODES` takes back.
 pub fn node(n: &Node) -> Result<String, ConfigError> {
     Ok(match n {
         Node::Service(s) => service(s)?,

@@ -25,7 +25,7 @@ pub(crate) const SINGLE_ARCH_EPERM: &[&str] = &["modify_ldt"];
 
 /// `ioctl` requests denied with `EPERM` by default, matched on the low 32
 /// bits of argument 1.
-pub const DEFAULT_IOCTL_EPERM: &[u32] = &[TIOCSTI, TIOCLINUX];
+pub(crate) const DEFAULT_IOCTL_EPERM: &[u32] = &[TIOCSTI, TIOCLINUX];
 
 /// [`DEFAULT_IOCTL_EPERM`] with the name of each request, for
 /// `--explain`.
@@ -54,7 +54,7 @@ const EXTRA_ARCHES: &[ScmpArch] = &[];
 #[cfg(target_arch = "x86_64")]
 pub const ARCHES: &str = "x86_64 + i386";
 #[cfg(not(target_arch = "x86_64"))]
-pub(crate) const ARCHES: &str = std::env::consts::ARCH;
+pub const ARCHES: &str = std::env::consts::ARCH;
 
 /// One compiled filter and the architectures it answers for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +86,7 @@ pub struct RuleSet {
     /// bits of argument 1.
     pub ioctl_eperm: Vec<u32>,
     /// Whether the hand-written prefix holds `personality` to
-    /// [`PERSONALITY_ALLOWED`]; off when `allow "personality"` is in the
+    /// `PERSONALITY_ALLOWED`; off when `allow "personality"` is in the
     /// profile.
     pub personality: bool,
 }
@@ -126,7 +126,7 @@ impl RuleSet {
     /// unless `userns` is disabled — with `cfg`'s allows removed
     /// and its denies appended, or `None` when the profile disabled the
     /// filter. Naming `ioctl` in either list drops the
-    /// [`DEFAULT_IOCTL_EPERM`] rules.
+    /// `DEFAULT_IOCTL_EPERM` rules.
     pub fn with(cfg: &SeccompConfig, userns: Userns) -> Option<Self> {
         if cfg.disable {
             return None;
@@ -334,7 +334,7 @@ fn export(filter: &ScmpFilterContext) -> Result<Vec<u8>, PlanError> {
 /// The persona values a sandbox may set: `PER_LINUX`, `PER_LINUX32`,
 /// `UNAME26`, both together, and the query. Values from
 /// `linux/personality.h`.
-pub const PERSONALITY_ALLOWED: [u32; 5] = [0x0, 0x8, 0x2_0000, 0x2_0008, 0xffff_ffff];
+pub(crate) const PERSONALITY_ALLOWED: [u32; 5] = [0x0, 0x8, 0x2_0000, 0x2_0008, 0xffff_ffff];
 
 // `AUDIT_ARCH_X86_64` and `AUDIT_ARCH_I386` from `linux/audit.h`.
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;

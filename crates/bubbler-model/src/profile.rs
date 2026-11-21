@@ -45,7 +45,7 @@ pub const PROFILE_HEADER: &str = "// bubbler profile: ";
 
 /// Where the system profile layer lives unless `$BUBBLER_PROFILE_DIR`
 /// names another directory.
-pub const SYSTEM_DIR: &str = "/usr/share/bubbler/profiles";
+pub(crate) const SYSTEM_DIR: &str = "/usr/share/bubbler/profiles";
 
 /// Longest chain of `include`s a profile may build. A limit is what keeps
 /// a mistyped include set from being read until the stack runs out.
@@ -80,7 +80,7 @@ pub fn lookup(name: &str) -> Option<&'static str> {
 pub enum Origin {
     /// `$XDG_CONFIG_HOME/bubbler/profiles`.
     User,
-    /// [`SYSTEM_DIR`] or `$BUBBLER_PROFILE_DIR`.
+    /// `SYSTEM_DIR` or `$BUBBLER_PROFILE_DIR`.
     System,
     /// Compiled into the binary.
     BuiltIn,
@@ -201,7 +201,8 @@ impl Resolver {
     }
 
     /// Directory of the system layer.
-    pub fn system_dir(&self) -> &Path {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn system_dir(&self) -> &Path {
         &self.system_dir
     }
 

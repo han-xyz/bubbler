@@ -16,7 +16,7 @@ use crate::plan_error::PlanError;
 /// config it indexes into, so it stays a tag here and text elsewhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
-    /// [`BwrapArgs::baseline`] or [`BwrapArgs::proxy_baseline`]: what
+    /// `BwrapArgs::baseline` or `BwrapArgs::proxy_baseline`: what
     /// every sandbox is restricted to before a grant relaxes it.
     Baseline,
     /// A compiled seccomp program.
@@ -94,7 +94,7 @@ enum Kind {
 // Not under `/usr`: bwrap 0.11.2 refuses a destination in that read-only
 // bind ("Can't mkdir parents for /usr/lib/bubbler/bubbler-init: Read-only
 // file system").
-pub const INIT_INSIDE: &str = "/run/bubbler-init";
+pub(crate) const INIT_INSIDE: &str = "/run/bubbler-init";
 
 /// Where the `flatpak-spawn` shim — the same `bubbler-init` binary — is bound
 /// in a sandbox that carries `/.flatpak-info`.
@@ -226,7 +226,7 @@ impl BwrapArgs {
     /// The restrictions every sandbox gets, which services relax explicitly.
     /// `--unshare-all` asks for the user namespace with `-try` (`bwrap(1)`),
     /// so without unprivileged user namespaces the sandbox may lack one.
-    pub fn baseline(env: &Env, instance_home: &Path, host: &dyn Host) -> Self {
+    pub(crate) fn baseline(env: &Env, instance_home: &Path, host: &dyn Host) -> Self {
         let mut a = Self {
             namespaces: Vec::new(),
             skeleton: Vec::new(),
@@ -431,7 +431,7 @@ impl BwrapArgs {
     /// The D-Bus proxy sidecar's sandbox: the sidecar baseline, each host bus
     /// asked for read-only, and `socket_dir` read-write for the filtered
     /// sockets. `socket_dir` is never the instance's runtime directory.
-    pub fn proxy_baseline(
+    pub(crate) fn proxy_baseline(
         host_bus: Option<&Path>,
         host_system_bus: Option<&Path>,
         host_a11y_bus: Option<&Path>,
@@ -536,7 +536,7 @@ impl BwrapArgs {
     /// Keep the host network namespace (`--share-net`). Idempotent:
     /// `--share-net` is emitted once however often this is called, and always
     /// directly after `--unshare-all`, which bwrap requires.
-    pub fn share_net(&mut self) {
+    pub(crate) fn share_net(&mut self) {
         let flag = OsStr::new("--share-net");
         if !self.namespaces.iter().any(|i| holds(i, flag)) {
             self.namespaces.insert(
@@ -880,7 +880,7 @@ impl BwrapArgs {
     /// Concatenate the phases, resolve data items through `alloc`, then append
     /// `--` and the command wrapped in [`INIT_INSIDE`]. The result is the
     /// complete argv after `bwrap`.
-    pub fn finish(
+    pub(crate) fn finish(
         self,
         command: &[OsString],
         alloc: &mut dyn FdAllocator,
@@ -891,7 +891,7 @@ impl BwrapArgs {
     /// [`BwrapArgs::finish`] with every operation kept apart and tagged
     /// with what produced it. Flattening the result is the argv again,
     /// element for element.
-    pub fn finish_explained(
+    pub(crate) fn finish_explained(
         self,
         command: &[OsString],
         alloc: &mut dyn FdAllocator,
@@ -899,7 +899,7 @@ impl BwrapArgs {
         Ok(self.finish_ops(command, alloc)?.ops)
     }
 
-    /// [`BwrapArgs::finish_explained`] that also remembers where bwrap's
+    /// `BwrapArgs::finish_explained` that also remembers where bwrap's
     /// options end, for a caller that reads the operations and then
     /// hands bwrap the argv.
     pub fn finish_ops(
@@ -967,7 +967,7 @@ impl BwrapArgs {
     /// Like [`BwrapArgs::finish`] but running `command` directly. Only
     /// sidecars use it: they have no exec channel to serve, so there is
     /// nothing for `bubbler-init` to supervise.
-    pub fn finish_plain(
+    pub(crate) fn finish_plain(
         self,
         command: &[OsString],
         alloc: &mut dyn FdAllocator,
@@ -979,7 +979,7 @@ impl BwrapArgs {
         Ok(Argv { args, command_at })
     }
 
-    /// [`BwrapArgs::finish_plain`] with every operation kept apart and tagged,
+    /// `BwrapArgs::finish_plain` with every operation kept apart and tagged,
     /// `command` carrying an origin per element: a sidecar's argv is its rule
     /// list, and each rule belongs to the node that asked for it.
     pub fn finish_plain_explained(

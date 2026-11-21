@@ -33,7 +33,7 @@ pub const MAX_BYTES: usize = 64 * 1024;
 /// Stack reserved for the thread [`parse_document`] runs the parser on. Measured in a debug
 /// build on x86_64, a `document` frame is about 3.3 KB, so 64 Ki of them need about 216 MB;
 /// this reservation leaves more than twice that.
-pub const PARSER_STACK: usize = 512 << 20;
+pub(crate) const PARSER_STACK: usize = 512 << 20;
 
 // The reservation above is half a gibibyte of address space charged every time a configuration
 // is read, and a 32-bit process has under four of them to charge it against.
@@ -57,7 +57,7 @@ pub const MAX_NESTING: usize = 32;
 /// shape — a mark between runs of text, two descents per mark — on the 2 MiB stack of a spawned
 /// thread, as [`MAX_NESTING`] does, so a comment is a rounding error on the stack
 /// [`parse_document`] reserves.
-pub const MAX_COMMENT_MARKS: usize = 128;
+pub(crate) const MAX_COMMENT_MARKS: usize = 128;
 
 /// Keys `env` may not set: the sandbox owns them.
 pub const RESERVED_ENV: &[&str] = &[
@@ -100,7 +100,7 @@ pub(crate) const RESERVED_ETC: &[&str] = &[
 /// Every top-level node a `config.kdl` may hold. [`crate::catalogue::GRANTS`] describes each
 /// entry, so what bubbler takes and what bubbler documents are one list. `include` is not here:
 /// it is the one node only a profile layer takes.
-pub const NODES: &[&str] = &[
+pub(crate) const NODES: &[&str] = &[
     "wayland",
     "x11",
     "network",
@@ -851,7 +851,7 @@ pub struct AudioSet {
     pub capturable: bool,
 }
 
-/// The nodes a config may hold more than once, in the order [`NODES`] lists them. Every other
+/// The nodes a config may hold more than once, in the order `NODES` lists them. Every other
 /// node is one per file: a second one is a [`ConfigError::Duplicate`], because which of the two
 /// applied would be a matter of file order.
 pub const REPEATABLE: &[&str] = &[
@@ -892,7 +892,7 @@ pub enum Node {
 }
 
 impl Node {
-    /// The KDL node it was written as, which is the name [`NODES`] and
+    /// The KDL node it was written as, which is the name `NODES` and
     /// [`crate::catalogue::GRANTS`] hold it under.
     pub fn name(&self) -> &'static str {
         match self {
@@ -1006,7 +1006,7 @@ pub struct InstanceConfig {
     /// not named after it.
     pub desktop: Option<String>,
     /// Nodes the file keeps without granting them: the `/-` lines, in the order
-    /// [`crate::kdl_out::nodes`] writes them. Nothing downstream of the parser sees them: they are
+    /// `crate::kdl_out::nodes` writes them. Nothing downstream of the parser sees them: they are
     /// neither granted, linted nor explained.
     pub disabled: Vec<Disabled>,
 }
@@ -1940,7 +1940,7 @@ impl Counts {
     }
 }
 
-/// Which section of the file a node belongs to, numbered in the order [`crate::kdl_out::nodes`]
+/// Which section of the file a node belongs to, numbered in the order `crate::kdl_out::nodes`
 /// writes the sections. Kept in step with that function by the round trip: a rank out of order
 /// writes a config that parses back as a different one. Everything that sorts or groups disabled
 /// entries ranks them through this, so there is one order and not one per reader.

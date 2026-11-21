@@ -258,7 +258,7 @@ fn entry_names(dir: &OwnedFd, max: usize) -> rustix::io::Result<Vec<OsString>> {
 
 /// Create `$XDG_RUNTIME_DIR/bubbler/<name>/` with mode 0700, reusing an existing one. Not a
 /// lock: a second start of the instance collides on the control socket in it.
-pub fn prepare_runtime_dir(env: &Env, inst: &Instance) -> Result<PathBuf, LaunchError> {
+pub(crate) fn prepare_runtime_dir(env: &Env, inst: &Instance) -> Result<PathBuf, LaunchError> {
     // Each level is created 0700 outright; a missing `$XDG_RUNTIME_DIR` is created but not its
     // parent, which would mean the session has no runtime dir.
     mkdir_private(&env.runtime_dir)?;

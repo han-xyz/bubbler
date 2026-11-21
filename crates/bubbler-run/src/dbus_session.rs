@@ -118,7 +118,8 @@ impl Session {
     }
 
     /// Whether the bus agreed to descriptor passing on this connection.
-    pub fn passes_fds(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn passes_fds(&self) -> bool {
         self.fd_passing
     }
 

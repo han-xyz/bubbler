@@ -1,6 +1,6 @@
 //! Where the host copies of bubbler's own binaries are: the
 //! `bubbler-init` supervisor every sandbox runs under, and — through
-//! [`locate_binary`] — the `bubbler-wl-proxy` sidecar a sandboxed
+//! `locate_binary` — the `bubbler-wl-proxy` sidecar a sandboxed
 //! `wayland` is served through. A run that cannot find one fails before
 //! bwrap is spawned.
 
@@ -23,7 +23,7 @@ pub(crate) const INSTALLED: &str = "/usr/lib/bubbler/bubbler-init";
 /// sandbox already has, while an override and a build tree's copy are
 /// wherever the user put them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Found {
+pub(crate) enum Found {
     /// The environment named it (`$BUBBLER_INIT`, `$BUBBLER_WL_PROXY`).
     Override,
     /// Beside the running executable, which is what a build tree has.
@@ -39,7 +39,7 @@ pub enum Found {
 /// Must be a regular file; an override that is not one is an error,
 /// never a silent fallback to another binary. `service` names the grant
 /// a failure is reported against.
-pub fn locate_binary(
+pub(crate) fn locate_binary(
     over: Option<&Path>,
     name: &str,
     installed: &str,

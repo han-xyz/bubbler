@@ -12,9 +12,8 @@ use crate::env::Env;
 use crate::error::{InstanceError, ReadError};
 use crate::profile::PROFILE_HEADER;
 
-pub use crate::catalogue::BARE_GRANTS as GRANTS;
-pub use crate::checks::APP_ID_SHARED_CHECK;
-pub use crate::names::is_plain_name;
+pub(crate) use crate::checks::APP_ID_SHARED_CHECK;
+pub(crate) use crate::names::is_plain_name;
 use crate::names::validate_name;
 
 pub const CONFIG_FILE: &str = "config.kdl";
@@ -373,6 +372,7 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalogue::BARE_GRANTS as GRANTS;
     use crate::kdl_out;
 
     #[test]

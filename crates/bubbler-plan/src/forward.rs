@@ -3,7 +3,7 @@
 //! takes an `O_PATH` descriptor of the file and returns a document id;
 //! the file then appears inside at `$XDG_RUNTIME_DIR/doc/<id>/<name>`.
 //!
-//! Nothing here widens a sandbox on its own: [`plan`] only classifies
+//! Nothing here widens a sandbox on its own: [`plan_args`] only classifies
 //! arguments, `forward_register::register` grants each file `read`, or
 //! `read`+`write` where the user could write it anyway, in one call per
 //! permission set, and every failure leaves the argument as it was.
@@ -83,7 +83,7 @@ pub enum Skip {
     AlreadyVisible,
 }
 
-/// What [`plan`] decided about one argument.
+/// What [`plan_args`] decided about one argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Planned {
     /// A host file to ask the portal for.
@@ -108,7 +108,8 @@ pub enum Planned {
 /// Classify every argument: which name a host file worth forwarding,
 /// which name one bubbler will not forward and why, which are not paths. `args` are the
 /// *arguments* of the sandboxed command, never the program itself; nothing is opened here.
-pub fn plan(
+#[cfg(test)]
+pub(crate) fn plan(
     env: &Env,
     cfg: &InstanceConfig,
     instance_home: &Path,
@@ -118,7 +119,7 @@ pub fn plan(
     plan_from(0, env, cfg, instance_home, args, host)
 }
 
-/// [`plan`] over a whole command line, the program included: index 0 is
+/// Classify every argument of a whole command line, the program included: index 0 is
 /// never a document, and the indices are into `cmd`, so [`rewrite`] takes that same slice.
 pub fn plan_args(
     env: &Env,
@@ -152,8 +153,8 @@ fn plan_from(
 }
 
 /// `args` with every file the sandbox will see put at its path inside; the rest are copied
-/// as they were, and an index past the end is dropped. `planned` must be the [`plan`] (or
-/// [`plan_args`]) of these same `args`, and `forwards` the `forward_register::register` of its candidates.
+/// as they were, and an index past the end is dropped. `planned` must be the
+/// [`plan_args`] of these same `args`, and `forwards` the `forward_register::register` of its candidates.
 pub fn rewrite(args: &[OsString], planned: &[Planned], forwards: &[Forward]) -> Vec<OsString> {
     debug_assert!(
         planned.len() <= args.len()

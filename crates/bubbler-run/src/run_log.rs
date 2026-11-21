@@ -104,7 +104,7 @@ pub struct Redirect {
 /// does; an exec into a live instance appends instead.
 ///
 /// With `truncate`, nothing is copied until the run says which it turned
-/// out to be — [`Redirect::started`], [`Redirect::joined`] or
+/// out to be — `Redirect::started`, [`Redirect::joined`] or
 /// [`Redirect::not_started`] — or the redirect is dropped, which empties
 /// the log as asked: a start that loses the race to another start of the
 /// instance, or is stopped while it waits on that one, must not empty the
@@ -186,7 +186,7 @@ impl Redirect {
     /// emptied before this returns, so a start that joins once the start
     /// lock is released adds to it after that, and everything the run
     /// wrote follows.
-    pub fn started(&self) {
+    pub(crate) fn started(&self) {
         // A failed truncation costs the old run's lines staying ahead of
         // this one's, nothing more.
         if let Some(file) = &self.to_empty {

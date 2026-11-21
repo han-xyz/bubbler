@@ -146,7 +146,8 @@ pub mod fake {
         /// Make `canonicalize` answer `None` for `p` and everything
         /// under it, the way the real host answers for a path that is
         /// not there.
-        pub fn unresolved(mut self, p: &str) -> Self {
+        #[cfg(test)]
+        pub(crate) fn unresolved(mut self, p: &str) -> Self {
             self.unresolved.insert(PathBuf::from(p));
             self
         }
@@ -224,7 +225,8 @@ pub mod fake {
 
     /// A character device `FileType`. `mknod` needs privileges the tests
     /// do not have, so it is read from `/dev/null`.
-    pub fn char_type() -> FileType {
+    #[cfg(test)]
+    pub(crate) fn char_type() -> FileType {
         std::fs::metadata("/dev/null")
             .expect("/dev/null exists wherever these tests can run")
             .file_type()

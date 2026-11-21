@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 ///
 /// The returned path is where it went wrong: the sibling for a failed
 /// write, `path` itself for a failed rename.
-pub fn write_atomic(path: &Path, text: &str) -> Result<(), (PathBuf, io::Error)> {
+pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<(), (PathBuf, io::Error)> {
     let Some(name) = path.file_name() else {
         let e = io::Error::new(io::ErrorKind::InvalidInput, "not a file path");
         return Err((path.to_path_buf(), e));

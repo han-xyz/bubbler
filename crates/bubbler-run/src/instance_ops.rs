@@ -345,7 +345,7 @@ pub fn delete(env: &Env, name: &str) -> Result<(), InstanceError> {
 /// Write `config` back to `config.kdl`, keeping the headers the file
 /// carries: the profile it was seeded from, so `reseed` still knows
 /// where to re-flatten it from, and the config version. `config.kdl`
-/// and `config.kdl.bak` are written through [`fsutil::write_atomic`]:
+/// and `config.kdl.bak` are written through `fsutil::write_atomic`:
 /// a symlink left under either name is replaced rather than written
 /// through.
 pub fn save(inst: &Instance, config: &InstanceConfig) -> Result<(), InstanceError> {

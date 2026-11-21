@@ -48,16 +48,13 @@ mod runtime_dir;
 mod spawn;
 mod wl_proxy;
 
-pub use alloc::RealAlloc;
+pub(crate) use alloc::RealAlloc;
 use alloc::spawning;
 use control::{STOPPED_CODE, bind_control_socket, lock_for_teardown};
-pub use dbus_proxy::{ProxyHandle, start_proxy};
 use identity::{FileGuard, publish_identity, read_sandbox_info, release_block, supervisor_pid};
 use network::NetworkSidecars;
-pub use pipewire::{PulseHandle, PwHandle, start_pw_context, start_pw_pulse};
-pub use runtime_dir::prepare_runtime_dir;
+pub(crate) use runtime_dir::prepare_runtime_dir;
 use runtime_dir::{join_session_keyring, prepare_app_runtime};
-pub use wl_proxy::{WaylandHandle, start_wayland};
 
 const POLL: Duration = Duration::from_millis(100);
 
@@ -583,8 +580,8 @@ pub fn exec(env: &Env, name: &str, argv: &[OsString], mode: TtyMode) -> Result<i
 
 #[cfg(test)]
 mod tests {
-    use super::dbus_proxy::adopt_proxy_bus;
-    use super::pipewire::adopt_socket;
+    use super::dbus_proxy::{ProxyHandle, adopt_proxy_bus, start_proxy};
+    use super::pipewire::{PulseHandle, PwHandle, adopt_socket, start_pw_context, start_pw_pulse};
     use super::*;
     use crate::pipewire;
     use crate::sidecar_argv::test_support::*;

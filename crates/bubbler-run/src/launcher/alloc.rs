@@ -26,7 +26,7 @@ use crate::sidecar_argv::{SIDECAR_PREFIX, data_name};
 /// D-Bus proxy a `/.flatpak-info` each, and the proxy is already running with its own bound when
 /// the application's argv is built.
 #[derive(Debug)]
-pub struct RealAlloc {
+pub(crate) struct RealAlloc {
     /// Fds bwrap inherits; they stay open until it has been spawned.
     pub fds: Vec<OwnedFd>,
     /// The listening control socket, already dup'ed without `CLOEXEC`;
@@ -73,7 +73,7 @@ impl RealAlloc {
 
     /// Allocate for a sidecar sandbox: generated files and a ready pipe, no control socket, and
     /// file names apart from the application sandbox's.
-    pub fn sidecar(dir: PathBuf) -> Self {
+    pub(crate) fn sidecar(dir: PathBuf) -> Self {
         Self::in_dir(dir, SIDECAR_PREFIX)
     }
 

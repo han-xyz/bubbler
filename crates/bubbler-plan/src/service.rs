@@ -1,6 +1,6 @@
 //! Turns granted services into builder calls. Each service touches only
 //! phase 4 (binds) and phase 5 (env); `network "host"` is the one
-//! exception that edits phase 1 via [`BwrapArgs::share_net`].
+//! exception that edits phase 1 via `BwrapArgs::share_net`.
 //!
 //! Paths come from untrusted host environment values, so every source is
 //! probed for its file *type*, never for mere existence: binding a

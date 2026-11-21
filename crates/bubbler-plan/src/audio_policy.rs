@@ -22,7 +22,7 @@ pub use crate::checks::{DIFFERS_CHECK, NOT_LOADED_CHECK};
 pub const DROP_IN: &str = include_str!("../../../contrib/wireplumber/50-bubbler.conf");
 
 /// File name WirePlumber loads the drop-in under, in any of
-/// [`install_dirs`].
+/// `install_dirs`.
 pub const DROP_IN_NAME: &str = "50-bubbler.conf";
 
 /// The linking hook the drop-in loads, exactly as shipped in
@@ -34,7 +34,7 @@ pub const HOOK: &str =
     include_str!("../../../contrib/wireplumber/scripts/bubbler/refuse-links.lua");
 
 /// Path WirePlumber loads the hook under, relative to one of
-/// [`hook_dirs`]; the name the drop-in's `wireplumber.components` gives
+/// `hook_dirs`; the name the drop-in's `wireplumber.components` gives
 /// it, so the two must change together.
 pub const HOOK_NAME: &str = "bubbler/refuse-links.lua";
 
@@ -55,7 +55,7 @@ const SYSCONF_DIR: &str = "/etc";
 /// lower-ranked file of the same name), so that copy is the one in
 /// effect. `$WIREPLUMBER_CONFIG_DIR`, which would replace the whole
 /// search, is not consulted, as for [`hook_dirs`].
-pub fn install_dirs(env: &Env) -> Vec<PathBuf> {
+pub(crate) fn install_dirs(env: &Env) -> Vec<PathBuf> {
     let bases = std::iter::once(env.config_home.as_path())
         .chain(env.config_dirs.iter().map(PathBuf::as_path))
         .chain(std::iter::once(Path::new(SYSCONF_DIR)))
@@ -82,7 +82,7 @@ pub fn install_dirs(env: &Env) -> Vec<PathBuf> {
 /// already holds and which is listed once either way.
 /// `$WIREPLUMBER_DATA_DIR`, which would replace the whole search, is not
 /// consulted: a session that sets it is a WirePlumber developer's.
-pub fn hook_dirs(env: &Env) -> Vec<PathBuf> {
+pub(crate) fn hook_dirs(env: &Env) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::with_capacity(env.data_dirs.len() + 2);
     let bases = std::iter::once(env.data_home.as_path())
         .chain(env.data_dirs.iter().map(PathBuf::as_path))
@@ -108,7 +108,7 @@ pub(crate) fn installed(host: &dyn Host, env: &Env) -> Option<PathBuf> {
 
 /// Full path of the installed hook: the first of [`hook_dirs`] that
 /// holds [`HOOK_NAME`]; `None` where none does.
-pub fn hook_installed(host: &dyn Host, env: &Env) -> Option<PathBuf> {
+pub(crate) fn hook_installed(host: &dyn Host, env: &Env) -> Option<PathBuf> {
     hook_dirs(env).into_iter().find_map(|dir| {
         let path = dir.join(HOOK_NAME);
         host.file_type(&path).is_some().then_some(path)
