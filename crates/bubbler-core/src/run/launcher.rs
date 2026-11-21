@@ -50,8 +50,8 @@ pub(crate) use crate::paths::{START_LOCK_SUFFIX, start_lock_path};
 use crate::tty::{self, Pty, RawGuard, RelayEnd, StdioTarget, TtyMode};
 use crate::wayland::{ProxyPlan, WaylandError};
 use crate::{
-    cgroup, dbus, exec, init_bin, network, pipewire, proc, run_log, seccomp, service, version,
-    version_probe, wayland,
+    cgroup, dbus, dbus_a11y, exec, init_bin, network, pipewire, proc, run_log, seccomp, service,
+    version, version_probe, wayland,
 };
 
 const POLL: Duration = Duration::from_millis(100);
@@ -685,7 +685,7 @@ pub fn explain_proxy(env: &Env, inst: &Instance) -> Result<Option<Vec<Explained>
     let a11y = plan
         .a11y
         .as_ref()
-        .map(|_| dbus::guarded_host_a11y_bus(&RealHost, env))
+        .map(|_| dbus_a11y::guarded_host_a11y_bus(&RealHost, env))
         .transpose()?;
     let dir = instance_runtime_dir(env, &inst.name);
     let mut alloc = DryRunAlloc::sidecar(dir.clone());
@@ -1513,7 +1513,7 @@ pub fn start_proxy(
         .a11y
         .as_ref()
         .map(|_| {
-            let path = dbus::guarded_host_a11y_bus(host, env)?;
+            let path = dbus_a11y::guarded_host_a11y_bus(host, env)?;
             service::require_socket(host, dbus::A11Y_NODE, path)
         })
         .transpose()?;

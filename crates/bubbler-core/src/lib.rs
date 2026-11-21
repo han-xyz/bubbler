@@ -35,6 +35,7 @@ pub use plan::version;
 pub use plan::wayland;
 pub use run::audio_policy_ask;
 pub use run::cgroup;
+pub use run::dbus_a11y;
 pub use run::dbus_wire;
 pub use run::desktop_ops;
 pub use run::exec;
