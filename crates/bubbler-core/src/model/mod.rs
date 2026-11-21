@@ -10,3 +10,4 @@ pub mod names;
 pub mod paths;
 pub mod profile;
 pub mod safe_text;
+pub mod wrap;

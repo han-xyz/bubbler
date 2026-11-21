@@ -36,6 +36,7 @@ use bubbler_core::safe_text;
 use bubbler_core::tty::{self, TtyMode};
 use bubbler_core::version;
 use bubbler_core::wrap;
+use bubbler_core::wrap_ops;
 use clap::builder::{OsStringValueParser, TypedValueParser};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
@@ -1834,7 +1835,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // the command line.
             let name = name.context("`wrap` takes an instance name or `--list`")?;
             let shim = as_name.clone().unwrap_or_else(|| name.clone());
-            let made = wrap::add(&env, &name, &shim, &bubbler)
+            let made = wrap_ops::add(&env, &name, &shim, &bubbler)
                 .with_context(|| format!("wrapping instance `{name}` as `{shim}`"))?;
             if made.adopted {
                 ediag!(
@@ -1860,7 +1861,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
         }
         Cmd::Unwrap { name } => {
             let bubbler = std::env::current_exe().context("locating the bubbler binary")?;
-            let path = wrap::remove(&env, &name, &bubbler)
+            let path = wrap_ops::remove(&env, &name, &bubbler)
                 .with_context(|| format!("removing shim `{name}`"))?;
             print_lines(&[path.as_os_str()], "the shim path")
         }
