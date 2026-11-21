@@ -41,6 +41,7 @@ pub use run::fsutil;
 pub use run::instance_ops;
 pub use run::launcher;
 pub use run::proc;
+pub use run::profile_ops;
 pub use run::run_log;
 pub use run::tty;
 pub use run::version;

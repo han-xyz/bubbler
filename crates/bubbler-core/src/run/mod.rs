@@ -8,6 +8,7 @@ pub mod fsutil;
 pub mod instance_ops;
 pub mod launcher;
 pub mod proc;
+pub mod profile_ops;
 pub mod run_log;
 pub mod tty;
 pub mod version;

@@ -6,7 +6,6 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::config::{
@@ -206,31 +205,13 @@ impl Resolver {
         &self.system_dir
     }
 
-    /// Path of `name` in the user layer, ready for an editor to open: the
-    /// directory exists, and a name the user layer does not hold yet is
-    /// written with a starting point. An existing file is never touched.
+    /// Path of `name` in the user layer, where an editor opens it. Nothing
+    /// is created here: `profile_ops::write_starter` does that.
     pub fn edit_path(&self, name: &str) -> Result<PathBuf, ProfileError> {
         if !is_plain_name(name) {
             return Err(ProfileError::InvalidName(name.to_owned()));
         }
-        let below = self.lookup(name)?.iter().any(|l| l.origin != Origin::User);
-        fs::create_dir_all(&self.user_dir)
-            .map_err(|e| ProfileError::Io(self.user_dir.clone(), e))?;
-        let path = self.user_dir.join(format!("{name}.kdl"));
-        // `create_new`: asking and writing are one operation, so a profile
-        // that appears in between is opened as it is rather than replaced.
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut f) => f
-                .write_all(starter(name, below).as_bytes())
-                .map_err(|e| ProfileError::Io(path.clone(), e))?,
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(ProfileError::Io(path, e)),
-        }
-        Ok(path)
+        Ok(self.user_dir.join(format!("{name}.kdl")))
     }
 
     /// Every layer holding `name`, user first, then system, then built-in.
@@ -461,7 +442,7 @@ fn names_in(dir: &Path) -> Result<Vec<String>, ProfileError> {
 }
 
 // An empty file would say nothing about what a profile may grant.
-const TEMPLATE: &str = "\
+pub(crate) const TEMPLATE: &str = "\
 // Grants a new instance is seeded with, e.g.:
 //   wayland
 //   network
@@ -470,10 +451,10 @@ const TEMPLATE: &str = "\
 //   command \"foot\"
 ";
 
-// The text `edit_path` writes for a profile the user layer does not hold yet: an `include` of the
+// The text `write_starter` writes for a profile the user layer does not hold yet: an `include` of the
 // layer below, so editing extends the shipped profile instead of forking it, or `TEMPLATE` when
 // there is none.
-fn starter(name: &str, below: bool) -> String {
+pub(crate) fn starter(name: &str, below: bool) -> String {
     // The name passed the profile name grammar, so it holds no quote,
     // backslash or newline that would need escaping here.
     let body = if below {
@@ -1176,7 +1157,7 @@ fn mode_conflict(node: &str, a: ShareMode, a_src: &Src, b: ShareMode, b_src: &Sr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::{
         BusRule, Clipboard, NestedX11, NetworkConfig, Portal, WaylandMode, X11Mode,
@@ -1220,7 +1201,7 @@ mod tests {
 
     /// A resolver over `<tmp>/config/bubbler/profiles` and `<tmp>/system`,
     /// with the named files written into them.
-    fn resolver(tmp: &Path, user: &[(&str, &str)], system: &[(&str, &str)]) -> Resolver {
+    pub(crate) fn resolver(tmp: &Path, user: &[(&str, &str)], system: &[(&str, &str)]) -> Resolver {
         let r = Resolver::new(&env(tmp));
         for (dir, files) in [
             (r.user_dir().to_path_buf(), user),
@@ -2951,47 +2932,6 @@ mod tests {
                     s
                 });
         assert_eq!(nodes, resolved.text);
-    }
-
-    #[test]
-    fn edit_path_seeds_an_include_of_the_layer_below() {
-        let tmp = tempfile::tempdir().unwrap();
-        let r = resolver(tmp.path(), &[], &[("only-system", "dri\n")]);
-        for name in ["firefox", "only-system"] {
-            let path = r.edit_path(name).unwrap();
-            assert_eq!(path, r.user_dir().join(format!("{name}.kdl")));
-            assert_eq!(
-                fs::read_to_string(&path).unwrap(),
-                format!("// bubbler profile: {name} (user layer)\ninclude \"{name}\"\n")
-            );
-            // What it seeds must resolve, or the editor opens a file that
-            // is already broken.
-            assert!(r.resolve(name).is_ok(), "{name}");
-        }
-    }
-
-    #[test]
-    fn edit_path_seeds_a_template_when_no_layer_below_holds_the_name() {
-        let tmp = tempfile::tempdir().unwrap();
-        let r = resolver(tmp.path(), &[], &[]);
-        let path = r.edit_path("mine").unwrap();
-        let text = fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            text,
-            format!("// bubbler profile: mine (user layer)\n{TEMPLATE}")
-        );
-        // A template of commented examples only, so the profile resolves
-        // to the same baseline `generic` does.
-        assert!(!text.contains("include"), "{text}");
-        assert_eq!(r.resolve("mine").unwrap().text, "");
-    }
-
-    #[test]
-    fn edit_path_never_touches_a_profile_that_is_already_there() {
-        let tmp = tempfile::tempdir().unwrap();
-        let r = resolver(tmp.path(), &[("mine", "network\n")], &[]);
-        let path = r.edit_path("mine").unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "network\n");
     }
 
     #[test]

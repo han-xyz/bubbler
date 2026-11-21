@@ -32,6 +32,7 @@ use bubbler_core::instance_ops;
 use bubbler_core::launcher;
 use bubbler_core::lint;
 use bubbler_core::profile;
+use bubbler_core::profile_ops;
 use bubbler_core::run_log;
 use bubbler_core::safe_text;
 use bubbler_core::tty::{self, TtyMode};
@@ -1684,13 +1685,12 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
                 print_lines(&lines, "the profile")
             }
             ProfileCmd::Edit { name } => {
-                // Before `edit_path`, which writes a starting point for a
+                // Before `write_starter`, which writes a starting point for a
                 // profile the user layer does not hold yet: an editor that
                 // cannot be resolved must leave nothing behind.
                 let (program, args) = editor_argv()?;
                 let profiles = profile::Resolver::new(&env);
-                let path = profiles
-                    .edit_path(&name)
+                let path = profile_ops::write_starter(&profiles, &name)
                     .with_context(|| format!("opening profile `{name}`"))?;
                 if let Some(code) = run_editor(&program, &args, &path)? {
                     return Ok(code);
