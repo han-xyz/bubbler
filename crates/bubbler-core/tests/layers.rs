@@ -15,19 +15,7 @@ type Entry = (&'static str, &'static str, &'static str);
 
 const DEBT: &[Entry] = &[];
 
-const TEST_DEBT: &[Entry] = &[
-    ("config", "network", "model/config/mod.rs:4296"),
-    ("profile", "audio_policy", "model/profile.rs:1604"),
-    ("profile", "bwrap", "model/profile.rs:3112"),
-    ("profile", "explain", "model/profile.rs:3132"),
-    ("profile", "host", "model/profile.rs:1165"),
-    ("profile", "init_bin", "model/profile.rs:3110"),
-    ("profile", "lint", "model/profile.rs:1166"),
-    ("profile", "network", "model/profile.rs:2019"),
-    ("profile", "service", "model/profile.rs:3106"),
-    ("profile", "sidecar_argv", "model/profile.rs:3118"),
-    ("profile", "version", "model/profile.rs:3148"),
-];
+const TEST_DEBT: &[Entry] = &[];
 
 const LAYERS: [&str; 3] = ["model", "plan", "run"];
 

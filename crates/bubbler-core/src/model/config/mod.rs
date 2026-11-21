@@ -4293,13 +4293,13 @@ mod tests {
     /// a proxy of its own, which is past the one opening the filter has.
     #[test]
     fn the_proxy_variables_are_reserved() {
-        for k in crate::network::PROXY_ENV_NAMES {
+        for k in network::PROXY_ENV_NAMES {
             let text = format!("network\nenv {k}=\"x\"\n");
             assert!(parse(&text).is_err(), "{k}");
         }
         assert_eq!(
-            &RESERVED_ENV[RESERVED_ENV.len() - crate::network::PROXY_ENV_NAMES.len()..],
-            &crate::network::PROXY_ENV_NAMES[..]
+            &RESERVED_ENV[RESERVED_ENV.len() - network::PROXY_ENV_NAMES.len()..],
+            &network::PROXY_ENV_NAMES[..]
         );
     }
 

@@ -401,6 +401,20 @@ impl fmt::Display for Cgroup {
 /// of bwrap's argv.
 pub const PROXY_PORT: u16 = 3128;
 
+/// Names of the variables [`proxy_env`](crate::network::proxy_env) sets,
+/// in the order it returns them. Every one of them is in
+/// [`crate::config::RESERVED_ENV`], so no `env` node can point the
+/// sandbox at a proxy of its own.
+pub const PROXY_ENV_NAMES: [&str; 7] = [
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "NODE_USE_ENV_PROXY",
+];
+
 /// The whole `network` node: its mode and what its children asked for.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NetworkConfig {

@@ -20,7 +20,7 @@ use crate::plan::plan_error::PlanError;
 
 pub use crate::config::network::{
     AllowHost, AllowOut, Cgroup, Cidr, Forward, HostPattern, Mode, NetworkConfig, Outbound,
-    PROXY_PORT, Proto,
+    PROXY_ENV_NAMES, PROXY_PORT, Proto,
 };
 pub use crate::names::PASTA_BIN;
 
@@ -122,19 +122,6 @@ pub struct ProxyFds<'a> {
     /// and never a file: the lines are about what the sandbox tried.
     pub log: &'a OsStr,
 }
-
-/// Names of the variables [`proxy_env`] sets, in the order it returns
-/// them. Every one of them is in [`crate::config::RESERVED_ENV`], so no
-/// `env` node can point the sandbox at a proxy of its own.
-pub const PROXY_ENV_NAMES: [&str; 7] = [
-    "HTTPS_PROXY",
-    "HTTP_PROXY",
-    "https_proxy",
-    "http_proxy",
-    "NO_PROXY",
-    "no_proxy",
-    "NODE_USE_ENV_PROXY",
-];
 
 // Destinations the sandbox reaches without the proxy, which is its own
 // loopback and nothing else.

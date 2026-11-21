@@ -12,6 +12,8 @@ pub mod lint;
 pub mod network;
 pub mod pipewire;
 pub mod plan_error;
+#[cfg(test)]
+mod profile_checks;
 pub mod seccomp;
 pub mod service;
 pub mod sidecar_argv;
