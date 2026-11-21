@@ -26,9 +26,8 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/han-xyz/bubbler"
 
 [workspace.dependencies]
-# `version` beside `path`: crates.io refuses a bare path dependency, and
-# `cargo deny` reads one as a wildcard requirement.  Bumped with
-# `workspace.package.version` at each release.
+# `version` beside `path` is kept in step with `workspace.package.version`:
+# scripts/release rewrites both at each release.
 bubbler-core = { path = "crates/bubbler-core", version = "0.27.0" }
 bubbler-model = { path = "crates/bubbler-model", version = "0.27.0" }
 bubbler-plan = { path = "crates/bubbler-plan", version = "0.27.0" }
