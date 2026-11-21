@@ -365,7 +365,7 @@ pub enum LaunchError {
     /// security context the `wayland` grant registers the sandbox as.
     /// The run stops rather than fall back to the session socket.
     #[error(transparent)]
-    Wayland(#[from] crate::wayland::WaylandError),
+    Wayland(#[from] crate::wayland_context::WaylandError),
     /// Command resolution failed (config had no `command` and none given).
     #[error(transparent)]
     Config(#[from] ConfigError),

@@ -723,7 +723,7 @@ pub fn require_security_context() -> bool {
     if real_wl_proxy().is_none() {
         return false;
     }
-    match bubbler_core::wayland::probe() {
+    match bubbler_core::wayland_context::probe() {
         Ok(true) => true,
         Ok(false) => {
             say("skipping: the compositor offers no wp_security_context_manager_v1");

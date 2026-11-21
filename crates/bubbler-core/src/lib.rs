@@ -51,4 +51,5 @@ pub use run::profile_ops;
 pub use run::run_log;
 pub use run::tty_relay;
 pub use run::version_probe;
+pub use run::wayland_context;
 pub use run::wrap_ops;

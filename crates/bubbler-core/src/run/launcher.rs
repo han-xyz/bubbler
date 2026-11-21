@@ -49,7 +49,8 @@ pub use crate::paths::{RUNTIME_SUBDIR, instance_runtime_dir};
 pub(crate) use crate::paths::{START_LOCK_SUFFIX, start_lock_path};
 use crate::tty::{self, Pty, StdioTarget, TtyMode};
 use crate::tty_relay::{self, RawGuard, RelayEnd};
-use crate::wayland::{ProxyPlan, WaylandError};
+use crate::wayland::ProxyPlan;
+use crate::wayland_context::{self, WaylandError};
 use crate::{
     cgroup, dbus, dbus_a11y, exec, init_bin, network, pipewire, proc, run_log, seccomp, service,
     version, version_probe, wayland,
@@ -1015,8 +1016,8 @@ pub fn start_wayland(
     // endpoint. wayrs reads the process environment itself, so both values go through it.
     let display = service::wayland_display(env)?;
     service::check_wayland_display(std::env::var_os("WAYLAND_DISPLAY").as_deref())?;
-    wayland::refuse_inherited(std::env::var_os("WAYLAND_SOCKET").as_deref())?;
-    let plan = match wayland::probe()? {
+    wayland_context::refuse_inherited(std::env::var_os("WAYLAND_SOCKET").as_deref())?;
+    let plan = match wayland_context::probe()? {
         true => ProxyPlan::context(dir, clipboard),
         false => {
             eprintln!(
@@ -1093,7 +1094,7 @@ fn bind_context(dir: &Path, instance: &str) -> Result<(OwnedFd, FileGuard), Laun
     // CLOEXEC on both ends: any other holder of the write end would keep the compositor accepting.
     let (close_read, close_write) =
         pipe_with(PipeFlags::CLOEXEC).map_err(|e| WaylandError::Pipe(e.into()))?;
-    wayland::create_context(
+    wayland_context::create_context(
         listener.into(),
         close_read,
         &dbus::app_id(instance),

@@ -13,4 +13,5 @@ pub mod profile_ops;
 pub mod run_log;
 pub mod tty_relay;
 pub mod version_probe;
+pub mod wayland_context;
 pub mod wrap_ops;
