@@ -2633,13 +2633,22 @@ the one `GetManagedObjects` call Wine builds its drive list from, never a
 `talk`, which would also hand the sandbox loop setup, mount and LUKS unlock,
 judged by polkit as you. `notify` and `tray` are there too, one rule each.
 
-`steam` runs Steam as `dbus-run-session -- steam`: a private session bus
+`steam` runs Steam under `dbus-run-session`: a private session bus
 inside the sandbox that reaches nothing of the host. The client's runtime
 launcher signals each helper's exit to the client by unique name, and
 xdg-dbus-proxy drops that signal, so behind the filtering proxy Steam hangs on
 its first helper. A `dbus` grant's address is replaced by the private bus, so
 it does nothing there, and `notify` and `tray` do not work. Its header still
 lists the system-bus rules above.
+
+The private bus starts no services: the profile runs `dbus-run-session` with
+`--config-file=/usr/share/bubbler/private-session.conf`, a session config that
+lists no service directories, so the host's portals, gvfs, at-spi and
+notification daemons named in `/usr/share/dbus-1/services` are not started
+inside the sandbox on a client's first call. The package installs that file;
+a build from source without the package lacks it, and `dbus-run-session`
+then refuses to start. Install `contrib/dbus/private-session.conf` there, or
+drop the `--config-file` argument from the instance's `command`.
 
 `steam` is also the one profile that must not be given `portals`, and that is
 not an oversight: the grant writes `/.flatpak-info`, Steam's own runtime reads

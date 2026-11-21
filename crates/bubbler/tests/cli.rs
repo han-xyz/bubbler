@@ -14188,6 +14188,43 @@ fn a_host_without_a_working_bwrap_skips_the_guarded_tests_rather_than_failing_th
     }
 }
 
+const DBUS_RUN_SESSION: &str = "/usr/bin/dbus-run-session";
+const BUSCTL: &str = "/usr/bin/busctl";
+
+/// The session config steam's private bus runs on activates nothing:
+/// the bus daemon is the only name a client can start.
+#[test]
+fn the_private_session_config_lists_no_activatable_names() {
+    if !require_host_program(DBUS_RUN_SESSION) || !require_host_program(BUSCTL) {
+        return;
+    }
+    let config =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contrib/dbus/private-session.conf");
+    let mut config_arg = std::ffi::OsString::from("--config-file=");
+    config_arg.push(&config);
+    let out = Command::new(DBUS_RUN_SESSION)
+        .arg(config_arg)
+        .args([
+            "--",
+            BUSCTL,
+            "--user",
+            "call",
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "ListActivatableNames",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim_end(),
+        "as 1 \"org.freedesktop.DBus\"",
+        "{stderr}"
+    );
+}
+
 /// One live smoke test per shipped profile, against this desktop's real
 /// Hyprland session and the apps actually installed on it. A GUI
 /// profile's test proves its window mapped; a CLI profile's proves its

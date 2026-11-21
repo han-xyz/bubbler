@@ -79,6 +79,9 @@ package_bubbler-git() {
     "$pkgdir/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf"
   install -Dm644 contrib/wireplumber/scripts/bubbler/refuse-links.lua \
     "$pkgdir/usr/share/wireplumber/scripts/bubbler/refuse-links.lua"
+  # The session config steam's private bus runs on: no service directories.
+  install -Dm644 contrib/dbus/private-session.conf \
+    "$pkgdir/usr/share/bubbler/private-session.conf"
 }
 
 package_bubbler-ui-git() {

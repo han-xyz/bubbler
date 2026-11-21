@@ -1333,9 +1333,14 @@ pub(crate) mod tests {
         assert_eq!(
             cfg("steam").command,
             Some(
-                ["dbus-run-session", "--", "steam"]
-                    .map(OsString::from)
-                    .to_vec()
+                [
+                    "dbus-run-session",
+                    "--config-file=/usr/share/bubbler/private-session.conf",
+                    "--",
+                    "steam"
+                ]
+                .map(OsString::from)
+                .to_vec()
             )
         );
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.26.5
+
+### Fixed
+
+- The steam profile's private D-Bus session bus starts no services: it runs on
+  a session config with no service directories, installed to
+  `/usr/share/bubbler/private-session.conf`, instead of starting the host's
+  portals and daemons inside the sandbox. An existing instance changes
+  `command` the same way: `command "dbus-run-session"
+  "--config-file=/usr/share/bubbler/private-session.conf" "--" "steam"`.
+
 ## 0.26.4
 
 ### Fixed

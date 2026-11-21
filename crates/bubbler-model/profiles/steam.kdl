@@ -115,4 +115,5 @@ network
 gamepad
 // Steam build 1792618285's runtime launcher signals a helper's exit by unique
 // name, which xdg-dbus-proxy 0.1.x drops; a private bus avoids the proxy.
-command "dbus-run-session" "--" "steam"
+// The private bus starts no services.
+command "dbus-run-session" "--config-file=/usr/share/bubbler/private-session.conf" "--" "steam"
