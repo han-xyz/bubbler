@@ -1,7 +1,7 @@
 pub mod audio_policy_ask;
 pub mod cgroup;
 pub mod dbus_a11y;
-pub mod dbus_wire;
+pub mod dbus_session;
 pub mod desktop_ops;
 pub mod exec;
 pub mod forward;

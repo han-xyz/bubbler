@@ -2,6 +2,7 @@ pub mod audio_policy;
 pub mod bwrap;
 pub mod cgroup_text;
 pub mod dbus;
+pub mod dbus_wire;
 pub mod desktop;
 pub mod explain;
 pub mod host;

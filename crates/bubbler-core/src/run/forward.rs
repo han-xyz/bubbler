@@ -18,7 +18,8 @@ use rustix::fs::{Mode, OFlags};
 
 use crate::bwrap::ETC_ALLOWLIST;
 use crate::config::{InstanceConfig, Service};
-use crate::dbus_wire::{Session, Value, WireError};
+use crate::dbus_session::Session;
+use crate::dbus_wire::{Value, WireError};
 use crate::env::{Env, SANDBOX_HOME};
 use crate::host::Host;
 
@@ -806,7 +807,7 @@ mod tests {
 
     use super::*;
     use crate::config::{Share, ShareMode};
-    use crate::dbus_wire::testing::*;
+    use crate::dbus_session::testing::*;
     use crate::host::fake::{FakeHost, char_type, types};
 
     fn env() -> Env {

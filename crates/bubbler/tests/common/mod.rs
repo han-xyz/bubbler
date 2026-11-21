@@ -952,7 +952,8 @@ fn a11y_has_owner() -> bool {
 /// [`bus_name_has_owner`] over bubbler's own bus client, for a host with
 /// no `dbus-send` to ask with.
 fn name_has_owner(bus: &Path, name: &str) -> bool {
-    use bubbler_core::dbus_wire::{Session, Value};
+    use bubbler_core::dbus_session::Session;
+    use bubbler_core::dbus_wire::Value;
 
     let Ok(mut session) = Session::connect(bus) else {
         return false;

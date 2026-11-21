@@ -19,7 +19,7 @@ use bubbler_core::audio_policy_ask;
 use bubbler_core::cgroup;
 use bubbler_core::config::{self, Service, Share, ShareMode, X11Mode};
 use bubbler_core::dbus;
-use bubbler_core::dbus_wire;
+use bubbler_core::dbus_session;
 use bubbler_core::desktop;
 use bubbler_core::desktop_ops;
 use bubbler_core::env::Env;
@@ -1107,9 +1107,9 @@ fn forwarded_or(
 // The address is resolved through the same guard a launch uses, so an
 // address pointing into bubbler's own runtime directory is refused here
 // too.
-fn portal_session(env: &Env) -> Result<dbus_wire::Session> {
+fn portal_session(env: &Env) -> Result<dbus_session::Session> {
     let bus = dbus::guarded_host_bus(&RealHost, env).context("resolving the session bus")?;
-    Ok(dbus_wire::Session::connect(&bus)?)
+    Ok(dbus_session::Session::connect(&bus)?)
 }
 
 // `argv[0]` is the only place the name this process was called by survives —

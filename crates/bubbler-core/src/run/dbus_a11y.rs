@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use crate::dbus::{
     A11Y_NODE, AddressFault, address_path, host_bus, outside_our_runtime, unix_path,
 };
-use crate::dbus_wire::{Session, Value, WireError};
+use crate::dbus_session::Session;
+use crate::dbus_wire::{Value, WireError};
 use crate::env::Env;
 use crate::error::LaunchError;
 use crate::host::Host;
@@ -110,7 +111,7 @@ fn bus_note(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::dbus::tests::env;
-    use crate::dbus_wire::testing::*;
+    use crate::dbus_session::testing::*;
     use std::ffi::OsString;
     use std::path::Path;
     use std::thread::JoinHandle;
