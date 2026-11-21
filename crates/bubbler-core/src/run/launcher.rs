@@ -3298,7 +3298,7 @@ fn start_and_wait(
     };
     let code = match &master {
         Some(master) => {
-            let out = tty::output_fd(&stdio, &host);
+            let out = tty_relay::output_fd(&stdio, &host);
             // The sink never refuses output, so this name is never printed.
             let (host_out, out_name) = match out {
                 Some(i) => (host[i].as_fd(), tty::FD_NAMES[i]),

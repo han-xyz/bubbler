@@ -277,7 +277,7 @@ pub fn run_in_with(
         };
         match &master {
             Some(master) => {
-                let out = tty::output_fd(&plan, &host);
+                let out = tty_relay::output_fd(&plan, &host);
                 // With nothing of the user's able to take the output it
                 // goes to the sink, which never refuses it, so the name
                 // is never printed.

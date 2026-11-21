@@ -6,7 +6,7 @@
 //! socket of a context created for this run, and every client that
 //! arrives through it is tagged on the daemon's side with the engine,
 //! the instance and the grant set — which is what the session manager's
-//! policy acts on. Nothing here starts anything: [`crate::launcher`]
+//! policy acts on. Nothing here starts anything: `crate::launcher`
 //! runs the sidecar, and this module says what it is.
 
 use std::ffi::OsString;

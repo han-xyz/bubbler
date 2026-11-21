@@ -347,7 +347,7 @@ const REVISION_KEY: &str = "revision";
 const REVISION_LINE: &str = "local POLICY_REVISION = ";
 
 /// The most of [`PW_DUMP`]'s output
-/// [`loaded_revision`](crate::audio_policy_ask::loaded_revision) reads; more is
+/// `audio_policy_ask::loaded_revision` reads; more is
 /// [`LoadedRevision::Unreadable`].
 // A desktop session's whole dump measured 413 KiB, a bed's 64 KiB (PipeWire 1.6.9).
 pub const DUMP_CAP: usize = 8 * 1024 * 1024;

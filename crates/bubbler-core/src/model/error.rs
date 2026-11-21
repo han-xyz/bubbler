@@ -325,7 +325,7 @@ pub enum LaunchError {
     #[error("the D-Bus proxy did not become ready")]
     ProxyNotReady,
     /// A stop signal arrived while a sidecar was starting, and the start
-    /// ended there. [`crate::launcher::run`] exits with a stopped run's
+    /// ended there. `crate::launcher::run` exits with a stopped run's
     /// code in its place.
     #[error("the start was stopped by a signal")]
     Stopped,

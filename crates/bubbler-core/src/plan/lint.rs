@@ -129,7 +129,7 @@ pub struct Context<'a> {
     pub host: &'a dyn Host,
     /// `$PATH` split into directories, for `command-not-found`.
     pub search_path: &'a [PathBuf],
-    /// [`crate::audio_policy_ask::loaded_revision`] outside the tests; asked only of a config with
+    /// `crate::audio_policy_ask::loaded_revision` outside the tests; asked only of a config with
     /// an audio grant and the whole policy installed.
     pub loaded_revision: &'a dyn Fn(&Env) -> LoadedRevision,
     /// The other instance whose portal app id the linted instance's is, for `app-id-shared`;

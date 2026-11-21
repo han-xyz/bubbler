@@ -4,7 +4,7 @@
 //! the file then appears inside at `$XDG_RUNTIME_DIR/doc/<id>/<name>`.
 //!
 //! Nothing here widens a sandbox on its own: [`plan`] only classifies
-//! arguments, [`register`](crate::forward_register::register) grants each file `read`, or
+//! arguments, `forward_register::register` grants each file `read`, or
 //! `read`+`write` where the user could write it anyway, in one call per
 //! permission set, and every failure leaves the argument as it was.
 
@@ -153,7 +153,7 @@ fn plan_from(
 
 /// `args` with every file the sandbox will see put at its path inside; the rest are copied
 /// as they were, and an index past the end is dropped. `planned` must be the [`plan`] (or
-/// [`plan_args`]) of these same `args`, and `forwards` the [`register`](crate::forward_register::register) of its candidates.
+/// [`plan_args`]) of these same `args`, and `forwards` the `forward_register::register` of its candidates.
 pub fn rewrite(args: &[OsString], planned: &[Planned], forwards: &[Forward]) -> Vec<OsString> {
     debug_assert!(
         planned.len() <= args.len()
