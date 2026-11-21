@@ -1,6 +1,17 @@
 # Changelog
 
-## 0.26.5
+## 0.27.0
+
+### Changed
+
+- The library is split into three crates, one per layer, with no behaviour
+  change: `bubbler-model` (the config and profiles, read from files),
+  `bubbler-plan` (what a sandbox will be, computed without side effects) and
+  `bubbler-run` (every process, socket and write). Dependencies point only
+  run → plan → model, and the compiler enforces it. `bubbler-core` remains as
+  a facade that re-exports the three. The launcher is now one file per
+  sidecar, each module has its own error type under `LaunchError` (messages
+  unchanged), and no workspace crate is publishable.
 
 ### Fixed
 
