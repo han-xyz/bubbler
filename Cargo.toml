@@ -26,8 +26,9 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/han-xyz/bubbler"
 
 [workspace.dependencies]
-# `version` beside `path` is kept in step with `workspace.package.version`:
-# scripts/release rewrites both at each release.
+# `version` beside `path`: `cargo deny` reads a bare path dependency as a
+# wildcard requirement, which deny.toml refuses. scripts/release keeps it in
+# step with `workspace.package.version`.
 bubbler-core = { path = "crates/bubbler-core", version = "0.27.0" }
 bubbler-model = { path = "crates/bubbler-model", version = "0.27.0" }
 bubbler-plan = { path = "crates/bubbler-plan", version = "0.27.0" }
