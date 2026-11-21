@@ -438,6 +438,33 @@ pub static GRANTS: &[Grant] = &[
     },
 ];
 
+/// Service names `Instance::ephemeral` accepts as grants: the bare
+/// config nodes, which take no arguments. Anything else needs a config
+/// file and therefore a real instance.
+pub const BARE_GRANTS: &[&str] = &[
+    "wayland",
+    "x11",
+    "network",
+    "dri",
+    "pipewire",
+    "pulseaudio",
+    "dbus",
+    "portals",
+    "screencast",
+    "remote-desktop",
+    "global-shortcuts",
+    "background",
+    "location",
+    "secrets",
+    "notify",
+    "tray",
+    "a11y",
+    "input-method",
+    "gamepad",
+    "hidraw",
+    "camera",
+];
+
 /// The catalogue entry for the node `node`, if it is one bubbler takes.
 pub fn grant(node: &str) -> Option<&'static Grant> {
     GRANTS.iter().find(|g| g.node == node)

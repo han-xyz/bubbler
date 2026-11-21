@@ -170,7 +170,7 @@ pub enum InstanceError {
     )]
     InvalidName(String),
     /// A grant name that is not one of the bare service nodes.
-    #[error("unknown grant `{0}`: valid grants are {names}", names = crate::instance::GRANTS.join(", "))]
+    #[error("unknown grant `{0}`: valid grants are {names}", names = crate::catalogue::BARE_GRANTS.join(", "))]
     InvalidGrant(String),
     /// The instance path is a symlink; bubbler never deletes through one.
     #[error("{0} is a symlink; refusing to delete through it")]

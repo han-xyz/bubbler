@@ -6,11 +6,13 @@ pub mod plan;
 pub mod run;
 
 pub use model::catalogue;
+pub use model::checks;
 pub use model::config;
 pub use model::env;
 pub use model::error;
 pub use model::json;
 pub use model::kdl_out;
+pub use model::names;
 pub use model::profile;
 pub use model::safe_text;
 pub use plan::bwrap;

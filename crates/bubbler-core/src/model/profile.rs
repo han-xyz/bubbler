@@ -11,14 +11,12 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{
     self, BusRule, ConfigError, Disabled, EtcMode, InstanceConfig, LintAllow, Node, Outbound,
-    RawProfile, Service, ShareMode, TmpSize, Userns,
+    RawProfile, SeccompConfig, Service, ShareMode, TmpSize, TtyMode, Userns,
 };
 use crate::env::Env;
 use crate::error::{ProfileError, ReadError};
-use crate::instance::is_plain_name;
 use crate::kdl_out;
-use crate::seccomp::SeccompConfig;
-use crate::tty::TtyMode;
+use crate::names::is_plain_name;
 
 /// Names of all built-in profiles, sorted.
 pub const NAMES: &[&str] = &[

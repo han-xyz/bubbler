@@ -19,6 +19,8 @@ use crate::config::InstanceConfig;
 use crate::env::Env;
 use crate::host::Host;
 
+pub use crate::checks::{DIFFERS_CHECK, NOT_LOADED_CHECK};
+
 /// The drop-in, exactly as shipped in `contrib/`. Loaded by the
 /// real-PipeWire test bed and printed verbatim by `bubbler audio-policy
 /// --print`.
@@ -196,14 +198,6 @@ pub fn missing(host: &dyn Host, env: &Env) -> Option<Missing> {
         (false, false) => Some(Missing::Both),
     }
 }
-
-/// The `lint-allow` id that accepts an installed policy file differing
-/// from this binary's: a copy edited on purpose. The same id names the
-/// lint check that reports it.
-pub const DIFFERS_CHECK: &str = "audio-policy-differs";
-
-/// The lint check for a policy the running WirePlumber has not loaded.
-pub const NOT_LOADED_CHECK: &str = "audio-policy-not-loaded";
 
 /// The warning where this run needs it: `cfg` grants `pipewire` or
 /// `pulseaudio` and the host holds less than the whole policy, or a

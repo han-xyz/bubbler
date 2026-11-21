@@ -11,8 +11,7 @@ use crate::error::LaunchError;
 use crate::host::Host;
 use crate::service;
 
-/// File name of the supervisor binary.
-pub const NAME: &str = "bubbler-init";
+pub use crate::names::INIT_BIN as NAME;
 
 /// Where a packaged bubbler installs the supervisor.
 pub const INSTALLED: &str = "/usr/lib/bubbler/bubbler-init";

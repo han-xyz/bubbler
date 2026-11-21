@@ -16,13 +16,11 @@ use std::ffi::{OsStr, OsString};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::{
-    BusRule, Clipboard, Disabled, EtcMode, InstanceConfig, LintAllow, NestedX11, Node, Service,
-    ShareMode, TmpSize, Userns, WaylandMode, X11Mode,
+    BusRule, Clipboard, Disabled, Errno, EtcMode, InstanceConfig, LintAllow, NestedX11,
+    NetworkConfig, NetworkMode, Node, Outbound, SeccompConfig, Service, ShareMode, TmpSize,
+    TtyMode, Userns, WaylandMode, X11Mode,
 };
 use crate::error::ConfigError;
-use crate::network::{Mode as NetworkMode, NetworkConfig, Outbound};
-use crate::seccomp::{Errno, SeccompConfig};
-use crate::tty::TtyMode;
 
 /// Canonical KDL for `cfg`: the nodes in the order the config holds them,
 /// one per line, block nodes indented by four spaces.

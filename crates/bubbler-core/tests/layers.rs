@@ -14,31 +14,18 @@ use std::path::Path;
 type Entry = (&'static str, &'static str, &'static str);
 
 const DEBT: &[Entry] = &[
-    ("config", "dbus", "model/config.rs:22"),
-    ("config", "lint", "model/config.rs:2465"),
-    ("config", "network", "model/config.rs:15"),
-    ("config", "seccomp", "model/config.rs:19"),
-    ("config", "tty", "model/config.rs:20"),
     ("dbus", "dbus_wire", "plan/dbus.rs:11"),
     ("dbus", "launcher", "plan/dbus.rs:15"),
-    ("error", "instance", "model/error.rs:173"),
     ("error", "wayland", "model/error.rs:368"),
     ("explain", "cgroup", "plan/explain.rs:13"),
     ("explain", "version", "plan/explain.rs:108"),
-    ("kdl_out", "network", "model/kdl_out.rs:23"),
-    ("kdl_out", "seccomp", "model/kdl_out.rs:24"),
-    ("kdl_out", "tty", "model/kdl_out.rs:25"),
     ("lint", "audio_policy", "plan/lint.rs:17"),
     ("lint", "desktop", "plan/lint.rs:19"),
-    ("lint", "instance", "plan/lint.rs:27"),
-    ("profile", "instance", "model/profile.rs:18"),
-    ("profile", "seccomp", "model/profile.rs:20"),
-    ("profile", "tty", "model/profile.rs:21"),
 ];
 
 const TEST_DEBT: &[Entry] = &[
     ("bwrap", "launcher", "plan/bwrap.rs:1167"),
-    ("config", "network", "model/config.rs:4292"),
+    ("config", "network", "model/config/mod.rs:4296"),
     ("dbus", "dbus_wire", "plan/dbus.rs:829"),
     ("explain", "audio_policy", "plan/explain.rs:1252"),
     ("explain", "version", "plan/explain.rs:850"),

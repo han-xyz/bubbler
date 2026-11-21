@@ -16,6 +16,11 @@ use crate::kdl_out;
 use crate::profile::{self, PROFILE_HEADER};
 use crate::{dbus, exec, host, launcher};
 
+pub use crate::catalogue::BARE_GRANTS as GRANTS;
+pub use crate::checks::APP_ID_SHARED_CHECK;
+pub use crate::names::is_plain_name;
+use crate::names::validate_name;
+
 const CONFIG_FILE: &str = "config.kdl";
 
 /// Header line recording which meanings a `config.kdl` was written
@@ -38,33 +43,6 @@ const PORTAL_CHILDREN_VERSION: u32 = 3;
 
 // Where `reseed` keeps the `config.kdl` it replaces.
 const BACKUP_FILE: &str = "config.kdl.bak";
-
-/// Service names [`Instance::ephemeral`] accepts as grants: the bare
-/// config nodes, which take no arguments. Anything else needs a config
-/// file and therefore a real instance.
-pub const GRANTS: &[&str] = &[
-    "wayland",
-    "x11",
-    "network",
-    "dri",
-    "pipewire",
-    "pulseaudio",
-    "dbus",
-    "portals",
-    "screencast",
-    "remote-desktop",
-    "global-shortcuts",
-    "background",
-    "location",
-    "secrets",
-    "notify",
-    "tray",
-    "a11y",
-    "input-method",
-    "gamepad",
-    "hidraw",
-    "camera",
-];
 
 /// Directory holding all instances.
 pub fn instances_root(env: &Env) -> PathBuf {
@@ -112,36 +90,6 @@ pub struct Instance {
     pub config_version: Option<u32>,
 }
 
-// Whether `name` is the shape [`Instance::ephemeral`] gives a throwaway
-// sandbox, `try-<pid>`, whose runtime directory is swept once that pid is
-// gone. An instance of that name would have its own swept out from under it.
-fn is_try_name(name: &str) -> bool {
-    name.strip_prefix("try-")
-        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// The name grammar instances and profiles share: `[A-Za-z0-9._-]+`, not
-/// `.` or `..`, and not starting with `-`. Such a name is one path
-/// component that cannot traverse out of a directory, and no CLI that
-/// takes it reads it as an option.
-pub fn is_plain_name(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.starts_with('-')
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
-}
-
-fn validate_name(name: &str) -> Result<(), InstanceError> {
-    if is_plain_name(name) && !is_try_name(name) {
-        Ok(())
-    } else {
-        Err(InstanceError::InvalidName(name.to_owned()))
-    }
-}
-
 // Bytes a `sockaddr_un` holds, the terminating NUL among them
 // (`unix(7)`).
 const SUN_PATH_MAX: usize = 108;
@@ -168,10 +116,6 @@ fn check_socket_paths(env: &Env, name: &str) -> Result<(), InstanceError> {
     }
     Ok(())
 }
-
-/// The `lint-allow` id that accepts two instances sharing a portal app id,
-/// and the lint check that reports it.
-pub const APP_ID_SHARED_CHECK: &str = "app-id-shared";
 
 /// The existing instance, other than `name` itself, whose portal app id is
 /// `name`'s.

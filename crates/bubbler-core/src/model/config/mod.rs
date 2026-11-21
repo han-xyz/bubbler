@@ -12,15 +12,19 @@ use std::str::FromStr;
 use kdl::{KdlDocument, KdlIdentifier, KdlNode};
 
 pub use crate::error::{ConfigError, ReadError};
-pub use crate::network::{
+pub use network::{
     AllowHost, AllowOut, Cidr, Forward, HostPattern, Mode as NetworkMode, NetworkConfig, Outbound,
     PROXY_PORT, Proto,
 };
-pub use crate::seccomp::{Errno, SeccompConfig};
-pub use crate::tty::TtyMode;
+pub use seccomp::{Errno, SeccompConfig};
+pub use tty::TtyMode;
 
-use crate::dbus;
-use crate::seccomp::{DEFAULT_ENOSYS_NUMBERED, syscall_number};
+use seccomp::{DEFAULT_ENOSYS_NUMBERED, syscall_number};
+
+pub(crate) mod dbus;
+pub(crate) mod network;
+pub(crate) mod seccomp;
+pub(crate) mod tty;
 
 /// Largest configuration bubbler hands to the KDL parser. The parser may take one stack frame
 /// per byte of the text, so the bytes are the bound on its depth.
@@ -332,7 +336,7 @@ pub struct Share {
 /// silenced; an error names something the file cannot do, and there is nothing to accept about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LintAllow {
-    /// A check id from [`crate::lint::CHECKS`].
+    /// A check id from [`crate::checks::CHECKS`].
     pub id: String,
     /// Why this file accepts the finding. Required: the reason is the whole value of writing the
     /// node down.
@@ -2462,7 +2466,7 @@ fn parse_lint_allow(node: &KdlNode) -> Result<LintAllow, ConfigError> {
         return Err(bad(node, "takes no children"));
     }
     let id = id.ok_or_else(|| bad(node, "expects exactly one check id argument"))?;
-    let Some(check) = crate::lint::check(id) else {
+    let Some(check) = crate::checks::check(id) else {
         // The id is echoed back only in the shape of one: a plain kebab-case word carries no
         // control bytes.
         let shape = id
@@ -2476,7 +2480,7 @@ fn parse_lint_allow(node: &KdlNode) -> Result<LintAllow, ConfigError> {
             ),
         });
     };
-    if check.severity == crate::lint::Severity::Error {
+    if check.severity == crate::checks::Severity::Error {
         return Err(bad(
             node,
             &format!("`{id}` reports an error, and an error cannot be accepted away"),
