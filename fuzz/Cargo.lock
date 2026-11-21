@@ -22,7 +22,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "bubbler-core"
-version = "0.26.4"
+version = "0.27.0"
 dependencies = [
  "bubbler-model",
  "bubbler-plan",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "bubbler-init"
-version = "0.26.4"
+version = "0.27.0"
 dependencies = [
  "rustix",
  "signal-hook",
@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "bubbler-model"
-version = "0.26.4"
+version = "0.27.0"
 dependencies = [
  "bubbler-net-proxy",
  "kdl",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "bubbler-net-proxy"
-version = "0.26.4"
+version = "0.27.0"
 dependencies = [
  "rustix",
  "thiserror",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "bubbler-plan"
-version = "0.26.4"
+version = "0.27.0"
 dependencies = [
  "bubbler-model",
  "kdl",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "bubbler-run"
-version = "0.26.4"
+version = "0.27.0"
 dependencies = [
  "bubbler-init",
  "bubbler-model",
