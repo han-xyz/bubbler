@@ -1,16 +1,14 @@
 //! Spawns bubblewrap and the sidecars a sandbox needs: the D-Bus, Wayland and
 //! egress proxies, the audio sidecars, pasta and `nft`. The only
 //! process-spawning code in the crate; it never goes through a shell.
-//! Every spawn is preceded by a [`fds::sweep_cloexec`], so a child holds
+//! Every spawn is preceded by a [`fds::sweep_cloexec`](bubbler_init::fds::sweep_cloexec), so a child holds
 //! only the descriptors it was meant to: each public function that spawns
 //! marks the caller's other descriptors above stdio close-on-exec, closing
 //! none. Every sidecar is killed on every way out of a run.
 
 use std::ffi::{OsStr, OsString, c_void};
-use std::io::{self, Seek, SeekFrom, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::io::{self, Write};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -20,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::event::{Nsecs, PollFd, PollFlags, Secs, Timespec, poll};
-use rustix::fs::{Access, AtFlags, FlockOperation, MemfdFlags, Mode, OFlags, SealFlags, flock};
+use rustix::fs::{Access, AtFlags, Mode, OFlags};
 use rustix::io::{Errno, FdFlags, fcntl_dupfd_cloexec, fcntl_setfd};
 use rustix::ioctl::{self, Opcode};
 use rustix::pipe::{PipeFlags, pipe_with};
@@ -35,9 +33,7 @@ use rustix::thread::{
 };
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 
-use bubbler_init::fds;
-
-use crate::bwrap::{Argv, Explained, FdAllocator};
+use crate::bwrap::{Argv, Explained};
 use crate::config::{NetworkConfig, Service, WaylandMode};
 use crate::env::Env;
 use crate::exec::SignalGuard;
@@ -54,16 +50,29 @@ pub use crate::sidecar_argv::{
     DryRunAlloc, build_argv, explain, explain_net_proxy, explain_wayland_proxy, proxy_argv,
     pw_context_argv, pw_pulse_argv, resolve_command, wl_proxy_argv, wl_proxy_plan,
 };
-use crate::sidecar_argv::{
-    SIDECAR_PREFIX, build_args_on, data_name, network_of, proxy_args, wayland_mode, wayland_node,
-};
+use crate::sidecar_argv::{build_args_on, network_of, proxy_args, wayland_mode, wayland_node};
 use crate::tty::{self, Pty, StdioTarget, TtyMode};
 use crate::tty_relay::{self, RawGuard, RelayEnd};
 use crate::wayland::ProxyPlan;
 use crate::wayland_context::{self, WaylandError};
 use crate::{
-    cgroup, dbus, dbus_a11y, exec, init_bin, network, pipewire, proc, run_log, service, version,
-    version_probe, wayland,
+    cgroup, dbus, dbus_a11y, exec, network, pipewire, run_log, service, version, version_probe,
+    wayland,
+};
+
+mod alloc;
+mod control;
+mod identity;
+mod runtime_dir;
+
+pub use alloc::RealAlloc;
+use alloc::spawning;
+use control::{STOPPED_CODE, bind_control_socket, lock_for_teardown};
+use identity::{FileGuard, publish_identity, read_sandbox_info, release_block, supervisor_pid};
+pub use runtime_dir::prepare_runtime_dir;
+use runtime_dir::{
+    decimal, fresh_sidecar_dir, join_session_keyring, mkdir_private, move_aside, open_dir,
+    open_dir_nofollow, prepare_app_runtime, remove_sidecar_dir,
 };
 
 const POLL: Duration = Duration::from_millis(100);
@@ -91,239 +100,6 @@ const PASTA_STOP: Duration = Duration::from_secs(1);
 const NET_PROXY_STOP: Duration = Duration::from_secs(5);
 
 const SUPERVISOR_WAIT: Duration = Duration::from_secs(2);
-
-/// Allocator for a real run: seccomp memfds, generated files in the run's runtime directory, the
-/// bound control socket and a sidecar ready pipe.
-///
-/// A generated file is the live source of a read-only bind, so its content must not change and it
-/// must not be unlinked while any sandbox holds that bind. Each allocator therefore owns the files
-/// it wrote and is the only thing that unlinks them, when it drops after its own sandbox has
-/// exited; and no two allocators of one run write the same path, which is what
-/// [`RealAlloc::sidecar`]'s name prefix is for — `portals` gives the application sandbox and the
-/// D-Bus proxy a `/.flatpak-info` each, and the proxy is already running with its own bound when
-/// the application's argv is built.
-#[derive(Debug)]
-pub struct RealAlloc {
-    /// Fds bwrap inherits; they stay open until it has been spawned.
-    pub fds: Vec<OwnedFd>,
-    /// The listening control socket, already dup'ed without `CLOEXEC`;
-    /// `None` for a sidecar, which serves no exec channel.
-    pub socket: Option<RawFd>,
-    /// The listening socket a sidecar accepts the application on, until
-    /// [`FdAllocator::listener`] hands it over. Handed out once: a
-    /// number given twice would be closed twice.
-    pub listen: Option<OwnedFd>,
-    listen_fd: Option<RawFd>,
-    options_fd: Option<RawFd>,
-    /// Read end of the ready pipe, once [`FdAllocator::ready_pipe`] made one.
-    pub ready_read: Option<OwnedFd>,
-    /// Read end of the info pipe bwrap reports the sandbox pid on.
-    pub info_read: Option<OwnedFd>,
-    /// Write end of the info pipe; the caller drops it once bwrap has
-    /// started, so the read end reports EOF if bwrap never answers.
-    pub info_write: Option<OwnedFd>,
-    /// Write end of the pipe the sandbox is blocked on. Writing to it or
-    /// dropping it is what lets the sandbox exec its command.
-    pub block_write: Option<OwnedFd>,
-    dir: PathBuf,
-    prefix: &'static str,
-    written: Vec<PathBuf>,
-}
-
-impl Drop for RealAlloc {
-    fn drop(&mut self) {
-        for path in self.written.drain(..) {
-            // A file left behind is overwritten by the next start of the same instance.
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-impl RealAlloc {
-    /// Allocate around an already inherited control socket fd. `dir` is the run's runtime
-    /// directory, which the caller has created.
-    pub fn new(socket: RawFd, dir: PathBuf) -> Self {
-        let mut a = Self::in_dir(dir, "");
-        a.socket = Some(socket);
-        a
-    }
-
-    /// Allocate for a sidecar sandbox: generated files and a ready pipe, no control socket, and
-    /// file names apart from the application sandbox's.
-    pub fn sidecar(dir: PathBuf) -> Self {
-        Self::in_dir(dir, SIDECAR_PREFIX)
-    }
-
-    fn in_dir(dir: PathBuf, prefix: &'static str) -> Self {
-        Self {
-            fds: Vec::new(),
-            socket: None,
-            listen: None,
-            listen_fd: None,
-            options_fd: None,
-            ready_read: None,
-            info_read: None,
-            info_write: None,
-            block_write: None,
-            dir,
-            prefix,
-            written: Vec::new(),
-        }
-    }
-
-    /// Allocate for a sidecar that accepts on a socket bubbler has
-    /// already bound and listened on, which it inherits by number.
-    pub fn sidecar_listening(listener: OwnedFd, dir: PathBuf) -> Self {
-        let mut a = Self::sidecar(dir);
-        a.listen = Some(listener);
-        a
-    }
-
-    fn keep(&mut self, fd: OwnedFd) -> OsString {
-        let n = fd.as_raw_fd();
-        self.fds.push(fd);
-        OsString::from(n.to_string())
-    }
-
-    fn close_listener(&mut self) {
-        if let Some(fd) = self.listen_fd.take() {
-            self.fds.retain(|held| held.as_raw_fd() != fd);
-        }
-    }
-
-    // A sealed memfd rather than a pipe, so nothing has to write while bwrap reads, whatever the
-    // length.
-    fn options(&mut self, options: &[OsString]) -> io::Result<OsString> {
-        if let Some(option) = options.iter().find(|o| o.as_bytes().contains(&0)) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("a bwrap option holds a NUL byte: {option:?}"),
-            ));
-        }
-        let fd = rustix::fs::memfd_create(
-            "bubbler-args",
-            MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
-        )?;
-        let mut f = std::fs::File::from(fd);
-        for option in options {
-            f.write_all(option.as_bytes())?;
-            f.write_all(b"\0")?;
-        }
-        f.seek(SeekFrom::Start(0))?;
-        rustix::fs::fcntl_add_seals(
-            &f,
-            SealFlags::SEAL | SealFlags::SHRINK | SealFlags::GROW | SealFlags::WRITE,
-        )?;
-        self.options_fd = Some(f.as_raw_fd());
-        Ok(self.keep(f.into()))
-    }
-
-    fn close_options(&mut self) {
-        if let Some(fd) = self.options_fd.take() {
-            self.fds.retain(|held| held.as_raw_fd() != fd);
-        }
-    }
-
-    // CLOEXEC at rest, cleared only around the one spawn they were built for. That window is
-    // process-wide; bubbler's other threads (run-log copier, KDL parser) open no fd, spawn nothing,
-    // and no configuration is parsed while the window is open.
-    fn inheritable(&self, on: bool) -> io::Result<()> {
-        let flags = match on {
-            true => FdFlags::empty(),
-            false => FdFlags::CLOEXEC,
-        };
-        for fd in &self.fds {
-            fcntl_setfd(fd, flags)?;
-        }
-        Ok(())
-    }
-
-    // The info pipe's write end is never CLOEXEC: the caller closes it by hand after the spawn. A
-    // caller closing a fd takes it out here too, or the next sweep would spare a recycled number.
-    fn intended(&self) -> Vec<RawFd> {
-        let mut fds: Vec<RawFd> = self.fds.iter().map(AsRawFd::as_raw_fd).collect();
-        fds.extend(self.socket);
-        fds.extend(self.info_write.as_ref().map(AsRawFd::as_raw_fd));
-        fds
-    }
-}
-
-// Call immediately before a spawn. Nothing is closed: bubbler's own descriptors only stop
-// crossing into children. Process-wide like `RealAlloc::inheritable`.
-fn spawning(keep: &[RawFd]) -> Result<(), LaunchError> {
-    fds::sweep_cloexec(keep).map_err(LaunchError::Descriptors)
-}
-
-impl FdAllocator for RealAlloc {
-    fn data(&mut self, content: &[u8]) -> io::Result<OsString> {
-        // Inheritable only around the spawn this argv was built for: no sidecar needs the sandbox's
-        // `/etc/passwd`, `/.flatpak-info` or resolver.
-        let fd = rustix::fs::memfd_create("bubbler-data", MemfdFlags::CLOEXEC)?;
-        let mut f = std::fs::File::from(fd);
-        f.write_all(content)?;
-        f.seek(SeekFrom::Start(0))?;
-        Ok(self.keep(f.into()))
-    }
-
-    // `O_NOFOLLOW` keeps the write in the runtime directory; the mode is set, not left to the
-    // umask, since bwrap gives the destination the source's mode.
-    fn file(&mut self, dest: &Path, content: &[u8]) -> io::Result<OsString> {
-        let path = self.dir.join(data_name(self.prefix, dest));
-        let mut f = std::fs::File::from(rustix::fs::open(
-            &path,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
-        )?);
-        rustix::fs::fchmod(&f, Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH)?;
-        f.write_all(content)?;
-        self.written.push(path.clone());
-        Ok(path.into_os_string())
-    }
-
-    fn init_socket(&mut self) -> io::Result<OsString> {
-        match self.socket {
-            Some(fd) => Ok(OsString::from(fd.to_string())),
-            None => Err(io::Error::other("this sandbox has no control socket")),
-        }
-    }
-
-    // One pipe per run: a second call replaces the first.
-    fn ready_pipe(&mut self) -> io::Result<OsString> {
-        let (read, write) = rustix::pipe::pipe()?;
-        fcntl_setfd(&read, FdFlags::CLOEXEC)?;
-        self.ready_read = Some(read);
-        Ok(self.keep(write))
-    }
-
-    fn listener(&mut self) -> io::Result<OsString> {
-        match self.listen.take() {
-            Some(fd) => {
-                self.listen_fd = Some(fd.as_raw_fd());
-                Ok(self.keep(fd))
-            }
-            None => Err(io::Error::other("this sidecar has no listening socket")),
-        }
-    }
-
-    // Kept apart from the other fds: the caller drops the write end right after the spawn, so a
-    // bwrap that never answers gives EOF instead of a hang.
-    fn info_pipe(&mut self) -> io::Result<OsString> {
-        let (read, write) = rustix::pipe::pipe()?;
-        fcntl_setfd(&read, FdFlags::CLOEXEC)?;
-        self.info_read = Some(read);
-        let n = write.as_raw_fd();
-        self.info_write = Some(write);
-        Ok(OsString::from(n.to_string()))
-    }
-
-    // The write end stays out of every child, so nothing but bubbler can release the sandbox.
-    fn block_pipe(&mut self) -> io::Result<OsString> {
-        let (read, write) = rustix::pipe::pipe()?;
-        fcntl_setfd(&write, FdFlags::CLOEXEC)?;
-        self.block_write = Some(write);
-        Ok(self.keep(read))
-    }
-}
 
 /// The D-Bus sidecar's argv with what produced each argument, or `None` where no bus is
 /// granted. Host sockets are not probed, but addresses are resolved as a run would, which for
@@ -1656,54 +1432,6 @@ fn start_net_proxy(
     Ok(handle)
 }
 
-// ENOSYS (no `CONFIG_KEYS`) is not a failure: there is no keyring to inherit either. rustix
-// wraps no keyring call, hence `libc`.
-fn join_session_keyring() -> io::Result<()> {
-    // SAFETY: one syscall taking its arguments by value, allocating
-    // nothing and touching no memory of this process — async-signal-safe,
-    // which is what a `pre_exec` closure is held to. The null name is
-    // what asks for a fresh anonymous keyring rather than a named one.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_keyctl,
-            u64::from(libc::KEYCTL_JOIN_SESSION_KEYRING),
-            0u64,
-        )
-    };
-    if rc >= 0 {
-        return Ok(());
-    }
-    let err = io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(libc::ENOSYS) => Ok(()),
-        _ => Err(err),
-    }
-}
-
-// For the proxy's `pre_exec`, where `format!` would allocate in a forked child.
-fn decimal(value: i32, buf: &mut [u8; 10]) -> &[u8] {
-    let mut value = value.unsigned_abs();
-    let mut at = buf.len();
-    loop {
-        at -= 1;
-        buf[at] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 || at == 0 {
-            break;
-        }
-    }
-    &buf[at..]
-}
-
-fn open_dir(path: &Path) -> Result<OwnedFd, LaunchError> {
-    rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| LaunchError::Io(path.to_path_buf(), e.into()))
-}
-
 // Move first, check second, as in `adopt_socket`. `node` is the config node that granted the
 // bus, so a failure names what the user would change.
 fn adopt_proxy_bus(
@@ -1779,458 +1507,6 @@ fn clear_socket_name(inst: &OwnedFd, dir: &Path, socket: &str) -> rustix::io::Re
         }
         Ok(_) | Err(Errno::NOENT) => Ok(()),
         Err(e) => Err(e),
-    }
-}
-
-// An existing directory is reused as is: only the user can create under `$XDG_RUNTIME_DIR`.
-fn mkdir_private(dir: &Path) -> Result<(), LaunchError> {
-    match rustix::fs::mkdir(dir, Mode::RWXU) {
-        Ok(()) | Err(Errno::EXIST) => Ok(()),
-        Err(e) => Err(LaunchError::Io(dir.to_path_buf(), e.into())),
-    }
-}
-
-// Bounds how long clearing dead runs' leftovers delays one start; the next start takes up
-// the rest.
-const LEFTOVER_BUDGET: usize = 100_000;
-
-// Only after this run's control-socket bind found no live run. Only one start at a time gets
-// there, and a run that is ending holds a start back until its teardown is done — except for a
-// start that binds in the moment between the sandbox's exit and the ending run taking the lock.
-// What is at the name is moved aside and removed best-effort, never followed.
-fn fresh_sidecar_dir(dir: &Path) -> Result<(), LaunchError> {
-    let io_at = |e: Errno| LaunchError::Io(dir.to_path_buf(), e.into());
-    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
-        unreachable!("a sidecar directory is named inside the instance's");
-    };
-    let at = open_dir(parent)?;
-    match rustix::fs::statat(&at, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Err(Errno::NOENT) => clear_leftovers(&at, name),
-        Err(e) => return Err(io_at(e)),
-        Ok(_) => move_aside(&at, parent, name).map_err(io_at)?,
-    }
-    rustix::fs::mkdirat(&at, name, Mode::RWXU).map_err(io_at)
-}
-
-// A rename within bubbler's own directory: no mode or depth refuses it, and a link moves as
-// the link.
-fn move_aside(at: &OwnedFd, dir: &Path, name: &OsStr) -> rustix::io::Result<()> {
-    let moved = rename_to_free(at, name, at, &mut 0, |seq| leftover_name(name, seq))?;
-    clear_leftovers(at, name);
-    if rustix::fs::statat(at, &moved, AtFlags::SYMLINK_NOFOLLOW).is_ok() {
-        eprintln!(
-            "bubbler: warning: {} is what a sidecar left and could not be removed in full; the next start tries again",
-            dir.join(moved).display()
-        );
-    }
-    Ok(())
-}
-
-// Only once the sidecar has exited. Not `std::fs::remove_dir_all`: it recurses, and a deep
-// enough tree overflows the stack.
-fn remove_sidecar_dir(dir: &Path) {
-    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
-        return;
-    };
-    let Ok(at) = open_dir(parent) else {
-        return;
-    };
-    let _ = remove_tree(&at, name, &mut LEFTOVER_BUDGET.clone());
-}
-
-// Only bubbler writes the instance's runtime directory, so the name need not be unguessable.
-fn leftover_name(name: &OsStr, seq: u64) -> OsString {
-    let mut aside = leftover_prefix(name);
-    aside.push(format!("{}.{seq}", std::process::id()));
-    aside
-}
-
-fn leftover_prefix(name: &OsStr) -> OsString {
-    let mut prefix = name.to_owned();
-    prefix.push(".leftover.");
-    prefix
-}
-
-// A failure is left for the next start; the start that moved the tree aside already warned.
-fn clear_leftovers(at: &OwnedFd, name: &OsStr) {
-    let prefix = leftover_prefix(name);
-    let mut budget = LEFTOVER_BUDGET;
-    // Only bubbler writes the instance's directory, so its width is not a
-    // sidecar's to choose.
-    let Ok(names) = entry_names(at, usize::MAX) else {
-        return;
-    };
-    for leftover in names {
-        if leftover.as_bytes().starts_with(prefix.as_bytes()) {
-            let _ = remove_tree(at, &leftover, &mut budget);
-        }
-    }
-}
-
-// Never replaces an entry; `seq` is left past the name taken.
-fn rename_to_free(
-    from: &OwnedFd,
-    name: &OsStr,
-    to: &OwnedFd,
-    seq: &mut u64,
-    make: impl Fn(u64) -> OsString,
-) -> rustix::io::Result<OsString> {
-    loop {
-        let new = make(*seq);
-        *seq += 1;
-        match rustix::fs::renameat_with(from, name, to, &new, rustix::fs::RenameFlags::NOREPLACE) {
-            Err(Errno::EXIST) => {}
-            Err(e) => return Err(e),
-            Ok(()) => return Ok(new),
-        }
-    }
-}
-
-// Names read before acting on them, so a directory of any width costs bounded memory.
-const READ_BATCH: usize = 1024;
-
-// A fixed number of descriptors at any depth: each pass empties the directories in the top
-// one and lifts their contents into it. Work done before `EAGAIN` stays done.
-fn remove_tree(at: &OwnedFd, name: &OsStr, budget: &mut usize) -> rustix::io::Result<()> {
-    let Some(top) = unlink_or_open(at, name)? else {
-        return Ok(());
-    };
-    let mut lifted = 0;
-    loop {
-        let names = entry_names(&top, READ_BATCH)?;
-        if names.is_empty() {
-            break;
-        }
-        for entry in names {
-            spend(budget)?;
-            let Some(inner) = unlink_or_open(&top, &entry)? else {
-                continue;
-            };
-            loop {
-                let subs = entry_names(&inner, READ_BATCH)?;
-                if subs.is_empty() {
-                    break;
-                }
-                for sub in subs {
-                    spend(budget)?;
-                    if unlink_or_open(&inner, &sub)?.is_some() {
-                        rename_to_free(&inner, &sub, &top, &mut lifted, |seq| {
-                            OsString::from(seq.to_string())
-                        })?;
-                    }
-                }
-            }
-            rustix::fs::unlinkat(&top, &entry, AtFlags::REMOVEDIR)?;
-        }
-    }
-    rustix::fs::unlinkat(at, name, AtFlags::REMOVEDIR)
-}
-
-fn spend(budget: &mut usize) -> rustix::io::Result<()> {
-    *budget = budget.checked_sub(1).ok_or(Errno::AGAIN)?;
-    Ok(())
-}
-
-// A sidecar can leave a directory no one may read or move; the mode changes on the opened
-// directory, never on whatever the path names by then, and no link is followed.
-fn unlink_or_open(at: &OwnedFd, name: &OsStr) -> rustix::io::Result<Option<OwnedFd>> {
-    let stat = rustix::fs::statat(at, name, AtFlags::SYMLINK_NOFOLLOW)?;
-    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
-        rustix::fs::unlinkat(at, name, AtFlags::empty())?;
-        return Ok(None);
-    }
-    let pinned = rustix::fs::openat(
-        at,
-        name,
-        OFlags::PATH | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    // `fchmod` refuses an `O_PATH` descriptor, and one opened for reading
-    // needs the permission this is restoring.
-    rustix::fs::chmod(format!("/proc/self/fd/{}", pinned.as_raw_fd()), Mode::RWXU)?;
-    rustix::fs::openat(
-        &pinned,
-        ".",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map(Some)
-}
-
-fn entry_names(dir: &OwnedFd, max: usize) -> rustix::io::Result<Vec<OsString>> {
-    let mut names = Vec::new();
-    for entry in rustix::fs::Dir::read_from(dir)? {
-        if names.len() == max {
-            break;
-        }
-        let entry = entry?;
-        let name = OsStr::from_bytes(entry.file_name().to_bytes());
-        if name != "." && name != ".." {
-            names.push(name.to_owned());
-        }
-    }
-    Ok(names)
-}
-
-/// Create `$XDG_RUNTIME_DIR/bubbler/<name>/` with mode 0700, reusing an existing one. Not a
-/// lock: a second start of the instance collides on the control socket in it.
-pub fn prepare_runtime_dir(env: &Env, inst: &Instance) -> Result<PathBuf, LaunchError> {
-    // Each level is created 0700 outright; a missing `$XDG_RUNTIME_DIR` is created but not its
-    // parent, which would mean the session has no runtime dir.
-    mkdir_private(&env.runtime_dir)?;
-    mkdir_private(&env.runtime_dir.join(RUNTIME_SUBDIR))?;
-    let dir = instance_runtime_dir(env, &inst.name);
-    mkdir_private(&dir)?;
-    Ok(dir)
-}
-
-// Only bubbler creates these, never a sandbox: whoever creates `app/<id>` decides what the
-// others bind. Why the check-then-bind window is no hole: threat model, app-runtime.
-fn prepare_app_runtime(env: &Env, services: &[Service]) -> Result<(), LaunchError> {
-    let ids: Vec<&str> = services
-        .iter()
-        .filter_map(|s| match s {
-            Service::AppRuntime { id, .. } => Some(id.as_str()),
-            _ => None,
-        })
-        .collect();
-    if ids.is_empty() {
-        return Ok(());
-    }
-    // Both levels 0700, the way `prepare_runtime_dir` makes its own: the
-    // order in the caller is not what should decide whether they are.
-    mkdir_private(&env.runtime_dir)?;
-    let app = env.runtime_dir.join("app");
-    mkdir_private(&app)?;
-    let at = open_dir_nofollow(rustix::fs::CWD, &app, &app, "app-runtime")?;
-    for id in ids {
-        let dir = service::app_runtime_dir(env, id);
-        // `mkdir` reports EEXIST for a symlink too, so the probe below is what catches one.
-        match rustix::fs::mkdirat(&at, id, Mode::RWXU) {
-            Ok(()) | Err(Errno::EXIST) => {}
-            Err(e) => return Err(LaunchError::Io(dir, e.into())),
-        }
-        open_dir_nofollow(&at, id, &dir, "app-runtime")?;
-    }
-    Ok(())
-}
-
-fn open_dir_nofollow<P: rustix::path::Arg>(
-    at: impl AsFd,
-    path: P,
-    named: &Path,
-    service: &'static str,
-) -> Result<OwnedFd, LaunchError> {
-    rustix::fs::openat(
-        at,
-        path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| match e {
-        Errno::LOOP | Errno::NOTDIR => LaunchError::Plan(PlanError::WrongType {
-            service,
-            path: named.to_path_buf(),
-            expected: "a directory",
-        }),
-        e => LaunchError::Io(named.to_path_buf(), e.into()),
-    })
-}
-
-// Scanned rather than parsed: bwrap adds members over time and only this one matters.
-fn parse_child_pid(buf: &[u8]) -> Option<i32> {
-    const KEY: &[u8] = b"\"child-pid\"";
-    let after = buf.windows(KEY.len()).position(|w| w == KEY)? + KEY.len();
-    let rest = &buf[after..];
-    let colon = rest.iter().position(|b| *b == b':')?;
-    let tail = &rest[colon + 1..];
-    let start = tail.iter().position(|b| !b.is_ascii_whitespace())?;
-    let end = start
-        + tail[start..]
-            .iter()
-            .take_while(|b| b.is_ascii_digit())
-            .count();
-    // Digits running to the end of the buffer may still be half read, so
-    // they only count once something follows them.
-    if end == start || end == tail.len() {
-        return None;
-    }
-    std::str::from_utf8(&tail[start..end]).ok()?.parse().ok()
-}
-
-// Braces counted outside strings: bwrap writes one multi-line document, and portals cannot
-// use a truncated one.
-fn json_object_end(buf: &[u8]) -> Option<usize> {
-    let mut depth = 0u32;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (i, b) in buf.iter().enumerate() {
-        match b {
-            _ if escaped => escaped = false,
-            b'\\' if in_string => escaped = true,
-            b'"' => in_string = !in_string,
-            b'{' if !in_string => depth += 1,
-            b'}' if !in_string => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(i + 1);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-// Portals read this same document back out of `bwrapinfo.json`, so it is returned as written.
-fn read_sandbox_info(
-    info: &OwnedFd,
-    child: &mut Child,
-    deadline: Instant,
-) -> Option<(i32, Vec<u8>)> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 512];
-    loop {
-        if let Some(end) = json_object_end(&buf)
-            && let Some(pid) = parse_child_pid(&buf[..end])
-        {
-            buf.truncate(end);
-            return Some((pid, buf));
-        }
-        if Instant::now() >= deadline || child.try_wait().ok()?.is_some() {
-            return None;
-        }
-        let slice = Timespec {
-            tv_sec: POLL.as_secs() as Secs,
-            tv_nsec: POLL.subsec_nanos() as Nsecs,
-        };
-        match poll(&mut [PollFd::new(info, PollFlags::IN)], Some(&slice)) {
-            // A signal during startup is acted on by the wait loop, so
-            // every interruption here is simply retried until the deadline.
-            Ok(0) | Err(_) => continue,
-            Ok(_) => {}
-        }
-        match rustix::io::read(info, &mut chunk) {
-            Ok(0) => return None,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            Err(Errno::INTR) => {}
-            Err(_) => return None,
-        }
-    }
-}
-
-// The reaper's child carries bwrap's name until it execs, and a failed exec leaves another.
-fn is_supervisor(pid: Pid) -> bool {
-    let comm = format!("/proc/{}/comm", pid.as_raw_nonzero());
-    std::fs::read_to_string(comm).is_ok_and(|name| name == format!("{}\n", init_bin::NAME))
-}
-
-// The reaper is pid 1 there and ignores outside signals it has no handler for; `bubbler-init`,
-// its first child, handles SIGTERM. Only once released: a held sandbox has not forked it.
-fn supervisor_pid(reaper: i32, child: &mut Child, deadline: Instant) -> Option<Pid> {
-    let children = PathBuf::from(format!("/proc/{reaper}/task/{reaper}/children"));
-    loop {
-        // An empty list or a child not yet exec'd is worth waiting on; a failed read means the
-        // sandbox is gone or the kernel has no `children` file, and neither improves.
-        let list = std::fs::read_to_string(&children).ok()?;
-        if let Some(pid) = list
-            .split_ascii_whitespace()
-            .next()
-            .and_then(|p| p.parse::<i32>().ok())
-            .and_then(Pid::from_raw)
-            && is_supervisor(pid)
-        {
-            return Some(pid);
-        }
-        if Instant::now() >= deadline || child.try_wait().ok()?.is_some() {
-            return None;
-        }
-        std::thread::sleep(POLL);
-    }
-}
-
-#[derive(Debug)]
-struct FileGuard(PathBuf);
-
-impl Drop for FileGuard {
-    fn drop(&mut self) {
-        // Nothing to report: a concurrent start may have replaced the
-        // socket, and a stale one is detected by connecting to it anyway.
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-// Removes only this run's entry: the `.flatpak` directory above it is shared with flatpak.
-struct FlatpakGuard(PathBuf);
-
-impl Drop for FlatpakGuard {
-    fn drop(&mut self) {
-        // Nothing to report: the directory holds this run's identity and
-        // nothing else, and a leftover only names a pid that is gone.
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-// Only a directory holding nothing but a `bwrapinfo.json` whose `child-pid` is dead; anything
-// else is someone's to keep.
-fn sweep_identity(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let names: Vec<OsString> = entries.flatten().map(|e| e.file_name()).collect();
-    if names != [OsString::from(dbus::BWRAPINFO)] {
-        return;
-    }
-    let Ok(info) = std::fs::read(dir.join(dbus::BWRAPINFO)) else {
-        return;
-    };
-    let gone = parse_child_pid(&info)
-        .and_then(Pid::from_raw)
-        .is_some_and(|pid| !proc::pid_alive(pid));
-    if gone {
-        let _ = std::fs::remove_dir_all(dir);
-    }
-}
-
-// Created outright, never adopted: a second run of the instance must not publish over the
-// first one's identity.
-fn publish_bwrapinfo(env: &Env, instance: &str, info: &[u8]) -> Result<FlatpakGuard, LaunchError> {
-    mkdir_private(&env.runtime_dir.join(dbus::FLATPAK_DIR))?;
-    let dir = dbus::flatpak_instance_dir(env, instance);
-    sweep_identity(&dir);
-    rustix::fs::mkdir(&dir, Mode::RWXU)
-        .map_err(|e| LaunchError::Io(dir.to_path_buf(), e.into()))?;
-    let guard = FlatpakGuard(dir.clone());
-    // Written and renamed inside the directory, so a portal reading it
-    // never sees half a document.
-    let tmp = dir.join(format!("{}.new", dbus::BWRAPINFO));
-    std::fs::write(&tmp, info).map_err(|e| LaunchError::Io(tmp.clone(), e))?;
-    let dest = dir.join(dbus::BWRAPINFO);
-    std::fs::rename(&tmp, &dest).map_err(|e| LaunchError::Io(dest, e))?;
-    Ok(guard)
-}
-
-// Never fatal: an app whose portal calls fail still runs.
-fn publish_identity(env: &Env, instance: &str, info: Option<&[u8]>) -> Option<FlatpakGuard> {
-    let Some(info) = info else {
-        eprintln!("bubbler: warning: the sandbox reported no pid, so portal operations will fail");
-        return None;
-    };
-    match publish_bwrapinfo(env, instance, info) {
-        Ok(guard) => Some(guard),
-        Err(e) => {
-            // `LaunchError::Io` shows the path; what went wrong is its source.
-            let why = std::error::Error::source(&e).map_or_else(String::new, |s| format!(": {s}"));
-            eprintln!("bubbler: warning: {e}{why}, so portal operations will fail");
-            None
-        }
-    }
-}
-
-// Closing the pipe releases the sandbox as the byte does, so a failed write still starts it.
-fn release_block(alloc: &mut RealAlloc) {
-    if let Some(fd) = alloc.block_write.take() {
-        let _ = rustix::io::write(&fd, b"\n");
     }
 }
 
@@ -2451,118 +1727,6 @@ fn start_run(
     match start_and_wait(env, inst, command, mode, &stop, &mut registered, log) {
         Err(LaunchError::Stopped) => Ok(STOPPED_CODE),
         code => code,
-    }
-}
-
-// What the command gives when the forwarded SIGTERM stops it.
-const STOPPED_CODE: i32 = 128 + SIGTERM;
-
-const START_LOCK_POLL: Duration = Duration::from_millis(50);
-
-// Follows no link, and no FIFO can park the open.
-fn open_start_lock(path: &Path) -> Result<OwnedFd, LaunchError> {
-    rustix::fs::open(
-        path,
-        OFlags::CREATE
-            | OFlags::WRONLY
-            | OFlags::NOFOLLOW
-            | OFlags::NONBLOCK
-            | OFlags::NOCTTY
-            | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .map_err(|e| LaunchError::Io(path.to_path_buf(), e.into()))
-}
-
-// The liveness check, the unlink of a dead run's socket and the bind all happen under the lock;
-// `log` is told the run started while it is held, so a joining start adds after the emptying.
-fn bind_control_socket(
-    dir: &Path,
-    lock_path: &Path,
-    name: &str,
-    stop: &AtomicBool,
-    log: Option<&run_log::Redirect>,
-) -> Result<(UnixListener, SocketGuard), LaunchError> {
-    let lock_err = |e: Errno| LaunchError::Io(lock_path.to_path_buf(), e.into());
-    let lock = open_start_lock(lock_path)?;
-    // Polled rather than blocking: the stop signals are installed with
-    // SA_RESTART, so a blocking `flock` would sleep through them.
-    loop {
-        match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => break,
-            Err(Errno::WOULDBLOCK | Errno::INTR) => {}
-            Err(e) => return Err(lock_err(e)),
-        }
-        if stop.load(Ordering::SeqCst) {
-            return Err(LaunchError::Stopped);
-        }
-        std::thread::sleep(START_LOCK_POLL);
-    }
-    let sock_path = dir.join(exec::SOCKET_NAME);
-    let io_at = |e: io::Error| LaunchError::Io(sock_path.clone(), e);
-    if exec::is_live_at(&sock_path) {
-        return Err(LaunchError::AlreadyRunning(name.to_owned()));
-    }
-    match std::fs::remove_file(&sock_path) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io_at(e)),
-        _ => {}
-    }
-    let listener = UnixListener::bind(&sock_path).map_err(io_at)?;
-    let held = rustix::fs::open(
-        &sock_path,
-        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| io_at(e.into()))?;
-    let bound = rustix::fs::fstat(&held).map_err(|e| io_at(e.into()))?;
-    let guard = SocketGuard {
-        id: (bound.st_dev as u64, bound.st_ino as u64),
-        path: sock_path,
-        _held: held,
-    };
-    if let Some(log) = log {
-        log.started();
-    }
-    Ok((listener, guard))
-}
-
-// Only the socket this run bound: a start after this sandbox exited may have bound its own.
-// The held descriptor keeps the inode allocated, so a later socket cannot reuse its number.
-#[derive(Debug)]
-struct SocketGuard {
-    path: PathBuf,
-    id: (u64, u64),
-    _held: OwnedFd,
-}
-
-impl Drop for SocketGuard {
-    fn drop(&mut self) {
-        let ours =
-            std::fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.id);
-        // Nothing to report: a socket left behind is found refused, and
-        // cleared, by the next start.
-        if ours {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-// Taken once the sandbox has exited, so a start made now waits for this run's teardown.
-// Blocking: a stop signal has usually ended the run by now, and another start holds the lock only
-// from its liveness check to its bind. A lock that cannot be had costs only that guarantee, so it
-// is a warning.
-fn lock_for_teardown(path: &Path) -> Option<OwnedFd> {
-    let locked = open_start_lock(path).and_then(|lock| {
-        flock(&lock, FlockOperation::LockExclusive)
-            .map(|()| lock)
-            .map_err(|e| LaunchError::Io(path.to_path_buf(), e.into()))
-    });
-    match locked {
-        Ok(lock) => Some(lock),
-        Err(e) => {
-            eprintln!("bubbler: warning: {e}");
-            None
-        }
     }
 }
 
@@ -2829,118 +1993,16 @@ mod tests {
 
     use crate::bwrap::Origin;
 
-    use crate::config::WaylandMode;
-
     use std::io::BufRead;
+    use std::os::unix::ffi::OsStrExt;
 
     use std::os::unix::net::UnixStream;
-
-    /// The pid the proxy's `pre_exec` writes into `cgroup.procs`, which
-    /// is formatted by hand because a forked child may not allocate. The
-    /// ends of the range and the one-digit case, since an off-by-one in
-    /// the buffer index would put the wrong process in the one cgroup
-    /// the filter accepts.
-    #[test]
-    fn the_pid_written_into_the_cgroup_is_formatted_exactly() {
-        let mut buf = [0u8; 10];
-        assert_eq!(decimal(1, &mut buf), b"1");
-        assert_eq!(decimal(0, &mut buf), b"0");
-        assert_eq!(decimal(4194304, &mut buf), b"4194304");
-        // The widest a pid can be, which fills the buffer exactly.
-        assert_eq!(decimal(i32::MAX, &mut buf), b"2147483647");
-    }
-
-    /// A session keyring is per-thread credentials, so joining one here
-    /// changes this thread's keyring and nothing else's. The id before
-    /// and after therefore has to differ: that is the whole of what the
-    /// sandbox gets — a keyring of its own rather than the login
-    /// session's, whatever a profile says about `keyctl`.
-    #[test]
-    fn joining_a_session_keyring_leaves_the_thread_on_a_new_one() {
-        // KEYCTL_GET_KEYRING_ID(KEY_SPEC_SESSION_KEYRING, create=0).
-        let id = || -> i64 {
-            // SAFETY: `keyctl` takes its arguments by value; this asks
-            // for the id of an existing keyring and creates nothing.
-            unsafe { libc::syscall(libc::SYS_keyctl, 0u64, -3i64, 0u64) }
-        };
-        let before = id();
-        if before < 0 {
-            // A kernel without CONFIG_KEYS has no keyring to inherit, so
-            // there is nothing to test rather than something that failed.
-            eprintln!("skipping: this host has no session keyring");
-            return;
-        }
-        join_session_keyring().unwrap();
-        let after = id();
-        assert!(after >= 0, "no keyring after joining one");
-        assert_ne!(before, after, "the thread kept the keyring it was given");
-    }
-
-    /// A socket a dead run left is cleared and bound again; one a run
-    /// answers on is that run's, and is left answering.
-    #[test]
-    fn a_start_binds_over_a_dead_socket_and_not_over_a_live_one() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("t");
-        std::fs::create_dir(&dir).unwrap();
-        let lock = tmp.path().join("t@start.lock");
-        let path = dir.join(exec::SOCKET_NAME);
-        let stop = AtomicBool::new(false);
-        exec::close_for_good(UnixListener::bind(&path).unwrap());
-        let (live, _guard) =
-            bind_control_socket(&dir, &lock, "t", &stop, None).expect("a fresh bind");
-        let again = bind_control_socket(&dir, &lock, "t", &stop, None);
-        assert!(
-            matches!(&again, Err(LaunchError::AlreadyRunning(n)) if n == "t"),
-            "{again:?}"
-        );
-        let _client = UnixStream::connect(&path).unwrap();
-        live.accept()
-            .expect("the first start's socket still answers");
-        assert!(lock.exists(), "the lock file is kept");
-        assert_eq!(
-            std::fs::read_dir(&dir).unwrap().count(),
-            1,
-            "only the socket is in the runtime directory"
-        );
-    }
-
-    /// A run's guard removes the socket it bound, and leaves one a later
-    /// start bound at the same path in its place.
-    #[test]
-    fn a_run_removes_its_own_socket_and_not_a_later_start_s() {
-        let tmp = tempfile::tempdir().unwrap();
-        let lock = tmp.path().join("t@start.lock");
-        let path = tmp.path().join(exec::SOCKET_NAME);
-        let stop = AtomicBool::new(false);
-        let (listener, guard) = bind_control_socket(tmp.path(), &lock, "t", &stop, None).unwrap();
-        exec::close_for_good(listener);
-        let (_later, later_guard) =
-            bind_control_socket(tmp.path(), &lock, "t", &stop, None).unwrap();
-        drop(guard);
-        assert!(path.exists(), "the later start's socket was removed");
-        drop(later_guard);
-        assert!(!path.exists(), "a run's own socket is removed");
-    }
-
-    /// A start waiting on another's lock is still ended by a stop signal.
-    #[test]
-    fn a_start_waiting_on_the_lock_ends_when_stopped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let lock = tmp.path().join("t@start.lock");
-        let held = std::fs::File::create(&lock).unwrap();
-        flock(&held, FlockOperation::LockExclusive).unwrap();
-        let stop = AtomicBool::new(true);
-        let waited = bind_control_socket(tmp.path(), &lock, "t", &stop, None);
-        assert!(matches!(waited, Err(LaunchError::Stopped)), "{waited:?}");
-        assert!(!tmp.path().join(exec::SOCKET_NAME).exists());
-    }
 
     /// The directory a real allocator gets in a test that allocates
     /// descriptors and no generated file: one that is not there, so a
     /// call to [`FdAllocator::file`] would fail rather than write
     /// somewhere real.
-    fn no_data_dir() -> PathBuf {
+    pub(super) fn no_data_dir() -> PathBuf {
         PathBuf::from("/nonexistent/bubbler")
     }
 
@@ -3075,138 +2137,6 @@ mod tests {
                 .any(|a| a.starts_with("--talk=") || a == "--filter"),
             "a rule is not the proxy's own argument: {own:?}"
         );
-    }
-
-    #[test]
-    fn runtime_dir_is_created_private_and_idempotent() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let e = env(tmp.path());
-        let i = inst(tmp.path(), "");
-        let d = prepare_runtime_dir(&e, &i).unwrap();
-        assert_eq!(d, tmp.path().join("run/bubbler/t"));
-        assert_eq!(
-            std::fs::metadata(&d).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        prepare_runtime_dir(&e, &i).unwrap();
-    }
-
-    #[test]
-    fn app_runtime_dirs_are_created_once_and_reused_whatever_their_mode() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let e = env(tmp.path());
-        let svcs = vec![
-            Service::AppRuntime {
-                id: "org.keepassxc.KeePassXC".to_owned(),
-                mode: crate::config::ShareMode::ReadWrite,
-            },
-            Service::AppRuntime {
-                id: "org.example.Other".to_owned(),
-                mode: crate::config::ShareMode::ReadOnly,
-            },
-        ];
-        prepare_app_runtime(&e, &svcs).unwrap();
-        let one = tmp.path().join("run/app/org.keepassxc.KeePassXC");
-        assert!(one.is_dir());
-        assert!(tmp.path().join("run/app/org.example.Other").is_dir());
-        // A native application creates the directory at 0755 (Qt's
-        // `mkpath`), and bubbler reuses it rather than fighting over the
-        // mode: `$XDG_RUNTIME_DIR` being 0700 is what keeps it private.
-        std::fs::set_permissions(&one, std::fs::Permissions::from_mode(0o755)).unwrap();
-        prepare_app_runtime(&e, &svcs).unwrap();
-        assert_eq!(
-            std::fs::metadata(&one).unwrap().permissions().mode() & 0o777,
-            0o755
-        );
-    }
-
-    #[test]
-    fn an_app_runtime_id_that_is_not_a_directory_is_refused() {
-        let tmp = tempfile::tempdir().unwrap();
-        let e = env(tmp.path());
-        std::fs::create_dir_all(tmp.path().join("run/app")).unwrap();
-        // A symlink where the directory belongs would bind whatever it
-        // points at, resolved on the host's side of the boundary.
-        std::os::unix::fs::symlink("/etc", tmp.path().join("run/app/org.example.App")).unwrap();
-        let svcs = vec![Service::AppRuntime {
-            id: "org.example.App".to_owned(),
-            mode: crate::config::ShareMode::ReadOnly,
-        }];
-        assert!(matches!(
-            prepare_app_runtime(&e, &svcs),
-            Err(LaunchError::Plan(PlanError::WrongType {
-                service: "app-runtime",
-                ..
-            }))
-        ));
-        std::fs::remove_file(tmp.path().join("run/app/org.example.App")).unwrap();
-        std::fs::write(tmp.path().join("run/app/org.example.App"), b"").unwrap();
-        assert!(matches!(
-            prepare_app_runtime(&e, &svcs),
-            Err(LaunchError::Plan(PlanError::WrongType {
-                service: "app-runtime",
-                ..
-            }))
-        ));
-    }
-
-    #[test]
-    fn an_app_parent_that_is_not_a_directory_is_refused() {
-        let tmp = tempfile::tempdir().unwrap();
-        let e = env(tmp.path());
-        std::fs::create_dir_all(tmp.path().join("run")).unwrap();
-        // `mkdir` reports EEXIST for a plain file too, so the probe of
-        // the parent is the only thing between this and an `openat` that
-        // would fail somewhere less legible.
-        std::fs::write(tmp.path().join("run/app"), b"").unwrap();
-        assert!(matches!(
-            prepare_app_runtime(
-                &e,
-                &[Service::AppRuntime {
-                    id: "org.example.App".to_owned(),
-                    mode: crate::config::ShareMode::ReadOnly,
-                }]
-            ),
-            Err(LaunchError::Plan(PlanError::WrongType {
-                service: "app-runtime",
-                ..
-            }))
-        ));
-    }
-
-    #[test]
-    fn an_app_parent_that_is_a_symlink_is_refused_before_any_id_is_made() {
-        let tmp = tempfile::tempdir().unwrap();
-        let e = env(tmp.path());
-        std::fs::create_dir_all(tmp.path().join("run")).unwrap();
-        std::fs::create_dir_all(tmp.path().join("elsewhere")).unwrap();
-        // `app` pointing away would make every id resolve outside the
-        // runtime directory while the sandbox binds the path the config
-        // named.
-        std::os::unix::fs::symlink(tmp.path().join("elsewhere"), tmp.path().join("run/app"))
-            .unwrap();
-        let svcs = vec![Service::AppRuntime {
-            id: "org.example.App".to_owned(),
-            mode: crate::config::ShareMode::ReadOnly,
-        }];
-        assert!(matches!(
-            prepare_app_runtime(&e, &svcs),
-            Err(LaunchError::Plan(PlanError::WrongType {
-                service: "app-runtime",
-                ..
-            }))
-        ));
-        assert!(!tmp.path().join("elsewhere/org.example.App").exists());
-    }
-
-    #[test]
-    fn a_config_without_app_runtime_creates_no_app_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let e = env(tmp.path());
-        prepare_app_runtime(&e, &[Service::Wayland(WaylandMode::default())]).unwrap();
-        assert!(!tmp.path().join("run/app").exists());
     }
 
     #[test]
@@ -3542,36 +2472,6 @@ mod tests {
         );
     }
 
-    /// The same for the two other directories a sidecar writes: whatever
-    /// a dead run left at their name is replaced by a fresh directory, a
-    /// link included, and what it pointed at is left alone.
-    #[test]
-    fn a_sidecar_directory_is_made_afresh_whatever_is_at_its_name() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("t");
-        std::fs::create_dir(&dir).unwrap();
-        let elsewhere = tmp.path().join("elsewhere");
-        std::fs::create_dir(&elsewhere).unwrap();
-        std::fs::write(elsewhere.join("sentinel"), b"sentinel").unwrap();
-        for sidecar in [pipewire::dir(&dir), dbus::socket_dir(&dir)] {
-            std::os::unix::fs::symlink(&elsewhere, &sidecar).unwrap();
-            fresh_sidecar_dir(&sidecar).unwrap();
-            let made = std::fs::symlink_metadata(&sidecar).unwrap();
-            assert!(made.is_dir(), "{} is still a link", sidecar.display());
-            assert_eq!(std::fs::read_dir(&sidecar).unwrap().count(), 0);
-            assert!(elsewhere.join("sentinel").exists());
-
-            std::fs::write(sidecar.join("left"), b"").unwrap();
-            fresh_sidecar_dir(&sidecar).unwrap();
-            assert_eq!(std::fs::read_dir(&sidecar).unwrap().count(), 0);
-
-            std::fs::remove_dir(&sidecar).unwrap();
-            std::fs::write(&sidecar, b"").unwrap();
-            fresh_sidecar_dir(&sidecar).unwrap();
-            assert!(std::fs::symlink_metadata(&sidecar).unwrap().is_dir());
-        }
-    }
-
     /// A sidecar runs as the user, so it can leave a tree no one may open
     /// in the directory it writes. Each real start path clears it before
     /// its sidecar starts, links inside it included, and changes nothing
@@ -3658,7 +2558,7 @@ mod tests {
 
     /// A chain of directories `depth` deep at `top`, made one level at a
     /// time so no path ever gets long; the deepest directory is returned.
-    fn plant_chain(top: &Path, depth: usize) -> OwnedFd {
+    pub(super) fn plant_chain(top: &Path, depth: usize) -> OwnedFd {
         let pin = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
         std::fs::create_dir(top).unwrap();
         let mut at = rustix::fs::open(top, pin, Mode::empty()).unwrap();
@@ -3672,7 +2572,7 @@ mod tests {
     /// The descriptor limit most desktops start a process with, so a tree
     /// deeper than half of it is deeper than one descriptor per level of
     /// a walk can reach.
-    fn with_desktop_fd_limit(test: impl FnOnce()) {
+    pub(super) fn with_desktop_fd_limit(test: impl FnOnce()) {
         use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
         let was = getrlimit(Resource::Nofile);
         let lowered = Rlimit {
@@ -3684,7 +2584,7 @@ mod tests {
         setrlimit(Resource::Nofile, was).unwrap();
     }
 
-    fn leftovers(dir: &Path, sidecar: &Path) -> Vec<OsString> {
+    pub(super) fn leftovers(dir: &Path, sidecar: &Path) -> Vec<OsString> {
         let mut prefix = sidecar.file_name().unwrap().to_owned();
         prefix.push(".");
         std::fs::read_dir(dir)
@@ -3692,59 +2592,6 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .filter(|n| n.as_bytes().starts_with(prefix.as_bytes()))
             .collect()
-    }
-
-    /// A sidecar can build a tree deeper than any walk holding a
-    /// descriptor per level can follow. The start still gets a fresh
-    /// directory, and the tree is gone rather than left beside it.
-    #[test]
-    fn a_tree_deeper_than_the_descriptor_limit_does_not_block_its_start() {
-        with_desktop_fd_limit(|| {
-            let tmp = tempfile::tempdir().unwrap();
-            let sidecar = pipewire::dir(tmp.path());
-            plant_chain(&sidecar, 1500);
-
-            fresh_sidecar_dir(&sidecar).unwrap();
-
-            assert!(std::fs::symlink_metadata(&sidecar).unwrap().is_dir());
-            assert_eq!(std::fs::read_dir(&sidecar).unwrap().count(), 0);
-            assert_eq!(leftovers(tmp.path(), &sidecar), Vec::<OsString>::new());
-        });
-    }
-
-    /// What the moved tree links to, at its deepest and behind levels no
-    /// one may open, is neither followed, removed nor given new modes.
-    #[test]
-    fn removing_a_moved_tree_changes_nothing_its_links_name() {
-        use std::os::unix::fs::PermissionsExt;
-        with_desktop_fd_limit(|| {
-            let tmp = tempfile::tempdir().unwrap();
-            let elsewhere = tmp.path().join("elsewhere");
-            std::fs::create_dir(&elsewhere).unwrap();
-            let sentinel = elsewhere.join("sentinel");
-            std::fs::write(&sentinel, b"sentinel").unwrap();
-            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
-            let before = (mode(&elsewhere), mode(&sentinel));
-            let dir = tmp.path().join("t");
-            std::fs::create_dir(&dir).unwrap();
-            let sidecar = dbus::socket_dir(&dir);
-            let bottom = plant_chain(&sidecar, 600);
-            rustix::fs::symlinkat(&sentinel, &bottom, "out").unwrap();
-            rustix::fs::symlinkat(&elsewhere, &bottom, "up").unwrap();
-            rustix::fs::chmod(
-                format!("/proc/self/fd/{}", bottom.as_raw_fd()),
-                Mode::empty(),
-            )
-            .unwrap();
-            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-            fresh_sidecar_dir(&sidecar).unwrap();
-
-            assert_eq!(std::fs::read_dir(&sidecar).unwrap().count(), 0);
-            assert_eq!(leftovers(&dir, &sidecar), Vec::<OsString>::new());
-            assert_eq!(std::fs::read(&sentinel).unwrap(), b"sentinel");
-            assert_eq!((mode(&elsewhere), mode(&sentinel)), before);
-        });
     }
 
     /// `PIPEWIRE_CONFIG_DIR` has no fallback for the main file, so a host
@@ -4188,58 +3035,6 @@ mod tests {
         }
     }
 
-    /// A tree with more entries than one pass may touch still shrinks on
-    /// every pass, so the starts that follow clear it in the end.
-    #[test]
-    fn clearing_a_tree_wider_than_the_budget_makes_progress_on_every_pass() {
-        let tmp = tempfile::tempdir().unwrap();
-        let top = tmp.path().join("t");
-        std::fs::create_dir(&top).unwrap();
-        for i in 0..30 {
-            std::fs::write(top.join(format!("f{i}")), b"").unwrap();
-        }
-        for i in 0..5 {
-            let sub = top.join(format!("d{i}"));
-            std::fs::create_dir_all(sub.join("deeper")).unwrap();
-            std::fs::write(sub.join("deeper").join("f"), b"").unwrap();
-            for j in 0..10 {
-                std::fs::write(sub.join(format!("f{j}")), b"").unwrap();
-            }
-        }
-        fn count(dir: &Path) -> usize {
-            std::fs::read_dir(dir)
-                .map(|entries| {
-                    entries
-                        .map(|e| {
-                            let e = e.unwrap();
-                            1 + if e.file_type().unwrap().is_dir() {
-                                count(&e.path())
-                            } else {
-                                0
-                            }
-                        })
-                        .sum()
-                })
-                .unwrap_or(0)
-        }
-        let at = open_dir(tmp.path()).unwrap();
-        let mut left = count(&top);
-        let passes = left;
-        for _ in 0..passes {
-            match remove_tree(&at, OsStr::new("t"), &mut 8) {
-                Ok(()) => {
-                    assert!(std::fs::symlink_metadata(&top).is_err());
-                    return;
-                }
-                Err(e) => assert_eq!(e, Errno::AGAIN),
-            }
-            let now = count(&top);
-            assert!(now < left, "a pass left {now} of {left} entries");
-            left = now;
-        }
-        panic!("{left} entries are never removed");
-    }
-
     /// A run killed between moving a planted directory to a socket's name
     /// and clearing it leaves it there; the next start moves it aside
     /// rather than failing to rename its socket onto it.
@@ -4320,200 +3115,6 @@ mod tests {
         assert!(elsewhere.join(socket).exists());
     }
 
-    /// A pid no process has: a child that has already been reaped.
-    fn dead_pid() -> u32 {
-        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
-        let pid = child.id();
-        child.wait().unwrap();
-        pid
-    }
-
-    fn bwrapinfo(pid: u32) -> Vec<u8> {
-        format!("{{\n    \"child-pid\": {pid},\n    \"x\": 1\n}}\n").into_bytes()
-    }
-
-    #[test]
-    fn a_dead_runs_identity_directory_is_swept_before_the_new_one_is_made() {
-        let tmp = tempfile::tempdir().unwrap();
-        let e = env(tmp.path());
-        let dir = dbus::flatpak_instance_dir(&e, "t");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(dbus::BWRAPINFO), bwrapinfo(dead_pid())).unwrap();
-        let guard = publish_bwrapinfo(&e, "t", &bwrapinfo(4321)).unwrap();
-        assert_eq!(
-            std::fs::read(dir.join(dbus::BWRAPINFO)).unwrap(),
-            bwrapinfo(4321)
-        );
-        drop(guard);
-        assert!(!dir.exists(), "the identity outlived the run");
-    }
-
-    #[test]
-    fn an_identity_directory_that_is_not_a_dead_runs_is_never_adopted() {
-        let tmp = tempfile::tempdir().unwrap();
-        let e = env(tmp.path());
-        let dir = dbus::flatpak_instance_dir(&e, "t");
-        // A live pid: another bubbler is using this instance's identity.
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(dbus::BWRAPINFO), bwrapinfo(std::process::id())).unwrap();
-        assert!(matches!(
-            publish_bwrapinfo(&e, "t", &bwrapinfo(4321)),
-            Err(LaunchError::Io(_, _))
-        ));
-        // Anything else in it is not something bubbler put there.
-        std::fs::write(dir.join(dbus::BWRAPINFO), bwrapinfo(dead_pid())).unwrap();
-        std::fs::write(dir.join("other"), b"").unwrap();
-        assert!(matches!(
-            publish_bwrapinfo(&e, "t", &bwrapinfo(4321)),
-            Err(LaunchError::Io(_, _))
-        ));
-        assert!(dir.join("other").is_file(), "a foreign file was removed");
-    }
-
-    #[test]
-    fn what_a_spawn_may_inherit_is_the_fds_the_socket_and_the_info_pipe() {
-        // A descriptor this test holds open, so the number below cannot be
-        // handed to one of the allocations that follow: a literal would
-        // be, whenever the process runs this test alone.
-        let socket = std::fs::File::open("/dev/null").unwrap();
-        let number = socket.as_raw_fd();
-        let mut alloc = RealAlloc::new(number, no_data_dir());
-        assert_eq!(alloc.intended(), vec![number]);
-        alloc.data(b"a").unwrap();
-        alloc.block_pipe().unwrap();
-        alloc.info_pipe().unwrap();
-        let held: Vec<RawFd> = alloc.fds.iter().map(AsRawFd::as_raw_fd).collect();
-        let info = alloc
-            .info_write
-            .as_ref()
-            .expect("the info pipe was allocated")
-            .as_raw_fd();
-        // The write end of the info pipe is the one bwrap must inherit
-        // that `inheritable` never touches, so a sweep that went by
-        // `fds` alone would take the sandbox pid with it.
-        let mut want = held;
-        want.push(number);
-        want.push(info);
-        assert_eq!(alloc.intended(), want);
-        // What `run` does once bwrap holds the socket: the number goes
-        // with the descriptor, so a later spawn's sweep is never told to
-        // spare a number the kernel has handed on to something else.
-        alloc.socket.take();
-        assert!(
-            !alloc.intended().contains(&number),
-            "a closed number is spared"
-        );
-    }
-
-    #[test]
-    fn real_alloc_block_pipe_hands_the_sandbox_the_read_end() {
-        use std::io::Read;
-        let mut alloc = RealAlloc::new(7, no_data_dir());
-        let fd = alloc.block_pipe().unwrap();
-        let read = alloc.fds.last().expect("the read end is inherited");
-        assert_eq!(fd, OsString::from(read.as_raw_fd().to_string()));
-        assert_eq!(rustix::io::fcntl_getfd(read).unwrap(), FdFlags::empty());
-        let write = alloc.block_write.take().expect("the write end stays here");
-        assert_eq!(rustix::io::fcntl_getfd(&write).unwrap(), FdFlags::CLOEXEC);
-        rustix::io::write(&write, b"\n").unwrap();
-        let mut got = [0u8; 1];
-        std::fs::File::from(read.try_clone().unwrap())
-            .read_exact(&mut got)
-            .unwrap();
-        assert_eq!(&got, b"\n");
-    }
-
-    #[test]
-    fn a_json_object_ends_at_its_closing_brace() {
-        let doc = b"{\n    \"child-pid\": 7\n}\n";
-        assert_eq!(json_object_end(doc), Some(doc.len() - 1));
-        assert_eq!(json_object_end(b"{\"a\": {\"b\": 1}}"), Some(15));
-        // Braces inside a string do not close the object, and a document
-        // still being written has no end yet.
-        assert_eq!(json_object_end(b"{\"a\": \"}\", \"b\": 1}"), Some(18));
-        assert_eq!(json_object_end(b"{\"a\": \"\\\"}\"}"), Some(12));
-        assert_eq!(json_object_end(b"{\n    \"child-pid\": 7"), None);
-        assert_eq!(json_object_end(b""), None);
-    }
-
-    #[test]
-    fn real_alloc_data_is_readable_from_the_start_and_inheritable_for_one_spawn() {
-        use std::io::Read;
-        let mut alloc = RealAlloc::new(7, no_data_dir());
-        let fd = alloc.data(b"hello").unwrap();
-        assert_eq!(alloc.init_socket().unwrap(), OsString::from("7"));
-        assert_eq!(alloc.fds.len(), 1);
-        assert_eq!(fd, OsString::from(alloc.fds[0].as_raw_fd().to_string()));
-        let flags = || rustix::io::fcntl_getfd(&alloc.fds[0]).unwrap();
-        // At rest the file is closed on exec, so the sidecars the run
-        // spawns around the sandbox — the proxy before it, pasta after
-        // it — never inherit the sandbox's `/etc/passwd` or its resolver.
-        assert_eq!(flags(), FdFlags::CLOEXEC);
-        alloc.inheritable(true).unwrap();
-        assert_eq!(flags(), FdFlags::empty());
-        alloc.inheritable(false).unwrap();
-        assert_eq!(flags(), FdFlags::CLOEXEC);
-        // A dup shares the file offset, so this reads what bwrap would read.
-        let mut got = String::new();
-        std::fs::File::from(alloc.fds[0].try_clone().unwrap())
-            .read_to_string(&mut got)
-            .unwrap();
-        assert_eq!(got, "hello");
-    }
-
-    /// bwrap splits its `--args` data at every NUL, so an option holding
-    /// one would arrive as two.
-    #[test]
-    fn real_alloc_options_refuse_an_option_holding_a_nul() {
-        use std::os::unix::ffi::OsStringExt;
-        let mut alloc = RealAlloc::sidecar(no_data_dir());
-        let options = [
-            OsString::from("--setenv"),
-            OsString::from_vec(b"A\0--bind".to_vec()),
-            OsString::from("x"),
-        ];
-        let err = alloc.options(&options).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(alloc.fds.is_empty());
-    }
-
-    #[test]
-    fn real_alloc_ready_pipe_keeps_the_read_end() {
-        use std::io::Read;
-        let mut alloc = RealAlloc::new(7, no_data_dir());
-        let fd = alloc.ready_pipe().unwrap();
-        let write = alloc.fds.last().expect("the write end is inherited");
-        assert_eq!(fd, OsString::from(write.as_raw_fd().to_string()));
-        assert_eq!(rustix::io::fcntl_getfd(write).unwrap(), FdFlags::empty());
-        rustix::io::write(write, b"x").unwrap();
-        let read = alloc.ready_read.take().expect("the read end stays here");
-        assert_eq!(rustix::io::fcntl_getfd(&read).unwrap(), FdFlags::CLOEXEC);
-        let mut got = [0u8; 1];
-        std::fs::File::from(read).read_exact(&mut got).unwrap();
-        assert_eq!(&got, b"x");
-    }
-
-    #[test]
-    fn real_alloc_info_pipe_splits_the_ends() {
-        use std::io::Read;
-        let mut alloc = RealAlloc::new(7, no_data_dir());
-        let fd = alloc.info_pipe().unwrap();
-        let write = alloc.info_write.take().expect("the write end is inherited");
-        assert_eq!(fd, OsString::from(write.as_raw_fd().to_string()));
-        assert_eq!(rustix::io::fcntl_getfd(&write).unwrap(), FdFlags::empty());
-        assert!(
-            alloc.fds.is_empty(),
-            "the write end is dropped by the caller"
-        );
-        rustix::io::write(&write, b"{}").unwrap();
-        drop(write);
-        let read = alloc.info_read.take().expect("the read end stays here");
-        assert_eq!(rustix::io::fcntl_getfd(&read).unwrap(), FdFlags::CLOEXEC);
-        let mut got = String::new();
-        std::fs::File::from(read).read_to_string(&mut got).unwrap();
-        assert_eq!(got, "{}");
-    }
-
     /// A namespace is the identity of its nsfs file, and the check is
     /// asked of the descriptor the run already holds rather than of a
     /// path resolved a second time — which is where a reused pid would
@@ -4535,26 +3136,6 @@ mod tests {
         // A path the run cannot ask about is never a match: a pid it
         // cannot check is one it must not act on either.
         assert!(same_namespace(held.as_fd(), Path::new("/proc/self/ns/nonesuch")).is_err());
-    }
-
-    #[test]
-    fn child_pid_is_scanned_out_of_bwraps_json() {
-        assert_eq!(
-            parse_child_pid(b"{\n    \"child-pid\": 4321,\n    \"net-namespace\": 7\n}"),
-            Some(4321)
-        );
-        assert_eq!(parse_child_pid(b"{\"child-pid\":9}"), Some(9));
-        // A pid still being written, no pid, and no member at all.
-        assert_eq!(parse_child_pid(b"{\n    \"child-pid\": 43"), None);
-        assert_eq!(parse_child_pid(b"{\n    \"child-pid\": }"), None);
-        assert_eq!(parse_child_pid(b"{\"cgroup-namespace\": 4026533374}"), None);
-        assert_eq!(parse_child_pid(b""), None);
-    }
-
-    #[test]
-    fn only_a_process_running_the_supervisor_is_signalled() {
-        let me = Pid::from_raw(std::process::id() as i32).expect("a live pid");
-        assert!(!is_supervisor(me), "this test binary is not the supervisor");
     }
 
     /// A child in the shape bwrap leaves a sandbox in: a network
