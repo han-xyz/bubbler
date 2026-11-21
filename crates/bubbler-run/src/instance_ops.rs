@@ -318,8 +318,8 @@ pub fn ephemeral(
 }
 
 /// Remove the instance directory, including its private home, and its
-/// runtime directory. Refuses to follow a symlink in place of the
-/// instance directory.
+/// runtime directory and start lock. Refuses to follow a symlink in place
+/// of the instance directory.
 pub fn delete(env: &Env, name: &str) -> Result<(), InstanceError> {
     validate_name(name)?;
     let dir = instances_root(env).join(name);
@@ -336,9 +336,15 @@ pub fn delete(env: &Env, name: &str) -> Result<(), InstanceError> {
     fs::remove_dir_all(&dir).map_err(io_err(&dir))?;
     let run = env.runtime_dir.join(launcher::RUNTIME_SUBDIR).join(name);
     match fs::remove_dir_all(&run) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(InstanceError::Io(run, e)),
+    }
+    let lock = launcher::start_lock_path(env, name);
+    match fs::remove_file(&lock) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(InstanceError::Io(run, e)),
+        Err(e) => Err(InstanceError::Io(lock, e)),
     }
 }
 
@@ -920,6 +926,19 @@ mod tests {
             Err(InstanceError::IsSymlink(_))
         ));
         assert!(tmp.path().join("elsewhere").exists());
+    }
+
+    #[test]
+    fn delete_removes_the_start_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = env(tmp.path());
+        env.runtime_dir = tmp.path().join("run");
+        create(&env, "a", "generic").unwrap();
+        let lock = launcher::start_lock_path(&env, "a");
+        fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        fs::write(&lock, b"").unwrap();
+        delete(&env, "a").unwrap();
+        assert!(!lock.exists());
     }
 
     #[test]

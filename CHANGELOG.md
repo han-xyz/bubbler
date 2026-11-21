@@ -21,6 +21,8 @@
   portals and daemons inside the sandbox. An existing instance changes
   `command` the same way: `command "dbus-run-session"
   "--config-file=/usr/share/bubbler/private-session.conf" "--" "steam"`.
+- `bubbler delete` now also removes the instance's start lock in the runtime
+  directory.
 
 ## 0.26.4
 
