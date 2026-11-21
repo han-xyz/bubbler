@@ -1,10 +1,19 @@
 # Development
 
 Repository: <https://github.com/han-xyz/bubbler>. Rust 1.95+, edition 2024.
-Workspace crates: `bubbler-core` (library: config, profiles, bwrap argv,
-services), `bubbler` (CLI), `bubbler-init` (in-sandbox supervisor),
+Workspace crates: `bubbler-model`, `bubbler-plan`, `bubbler-run` (the three
+library layers), `bubbler-core` (a facade that re-exports their modules at one
+path), `bubbler` (CLI), `bubbler-init` (in-sandbox supervisor),
 `bubbler-wl-proxy` (the Wayland proxy), `bubbler-net-proxy` (the egress proxy),
 `bubbler-ui` (terminal editor). Only `bubbler-ui` links a TUI toolkit.
+
+The layers depend one way, model ← plan ← run. The model layer is what a user
+declares and bubbler reads back (profiles, instances, grants, checks); the plan
+layer turns a resolved instance into what a run will do, as data, reading the
+host only through the `Host` seam; the run layer carries the plan out and is
+the only one that spawns or writes to the host. The crate dependencies hold
+the direction; each of `bubbler-model` and `bubbler-plan` has a `clippy.toml`
+that refuses spawning a process and writing files.
 
 ## Build
 
@@ -43,8 +52,8 @@ tests: emitter/parser round trip, desktop patch idempotence, include resolver
 never recursing past the stack.
 
 Tests that reach your desktop session — its session and system bus (the
-`cli` tests and the `the_real_session_bus_*` unit tests in `bubbler-core`'s
-`dbus_wire`), portals, tray, accessibility bus, compositor, clipboard and
+`cli` tests and the `the_real_session_bus_*` unit tests in `bubbler-run`'s
+`dbus_session`), portals, tray, accessibility bus, compositor, clipboard and
 PipeWire — and the audio policy test bed below, which starts PipeWire and
 WirePlumber daemons of its own, run only with `BUBBLER_TEST_SESSION=1`:
 
@@ -208,13 +217,15 @@ both commands in a throwaway repository.
 
 | Path | Purpose |
 |---|---|
-| `crates/bubbler-core/src/bwrap.rs` | the only place bwrap flags are emitted; `ETC_ALLOWLIST` |
-| `crates/bubbler-core/src/service.rs` | each grant node to bwrap arguments |
-| `crates/bubbler-core/src/network.rs` | pasta argv, nft ruleset, `allow-host` and the egress proxy's argv |
-| `crates/bubbler-core/src/cgroup.rs` | the `sandbox`/`proxy` cgroup leaves an `allow-host` run needs |
-| `crates/bubbler-core/src/seccomp.rs` | `DEFAULT_EPERM`, `DEFAULT_ENOSYS`, filter compile |
-| `crates/bubbler-core/src/dbus.rs` | proxy plan |
-| `crates/bubbler-core/src/lint.rs` | every check id |
+| `crates/bubbler-plan/src/bwrap.rs` | the only place bwrap flags are emitted; `ETC_ALLOWLIST` |
+| `crates/bubbler-plan/src/service.rs` | each grant node to bwrap arguments |
+| `crates/bubbler-plan/src/network.rs` | pasta argv, nft ruleset, `allow-host` and the egress proxy's argv |
+| `crates/bubbler-run/src/cgroup.rs` | the `sandbox`/`proxy` cgroup leaves an `allow-host` run needs |
+| `crates/bubbler-model/src/config/seccomp.rs` | `DEFAULT_EPERM`, `DEFAULT_ENOSYS` |
+| `crates/bubbler-plan/src/seccomp.rs` | filter compile |
+| `crates/bubbler-plan/src/dbus.rs` | proxy plan |
+| `crates/bubbler-model/src/checks.rs` | every check id |
+| `crates/bubbler-plan/src/lint.rs` | the checks run over a profile |
 | `crates/bubbler-model/profiles/*.kdl` | built-in profiles |
 | `docs/threat-model.md` | long-form threat model |
 | `contrib/apparmor/` | untested AppArmor profile |

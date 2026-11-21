@@ -3896,7 +3896,7 @@ every runtime that falls back gracefully is tested against), `pidfd_getfd`
 pid namespace with `bubbler-init` and with every command run through the exec
 channel) and `kcmp` (compares two processes' kernel objects, a side channel
 out of the sandbox's own process tree) — the list is `DEFAULT_EPERM` in
-`crates/bubbler-core/src/seccomp.rs`. Two `ioctl` requests
+`crates/bubbler-model/src/config/seccomp.rs`. Two `ioctl` requests
 are denied by their argument as well: `TIOCSTI` (0x5412) and `TIOCLINUX`
 (0x541C), which push bytes into a terminal's input queue (CVE-2017-5226,
 CVE-2023-28100). `ENOSYS`: `clone3` (seccomp cannot inspect its
@@ -4080,7 +4080,7 @@ trade and binds it with no permission of its own. A kernel without the module
 loaded simply has no node, and then nothing is bound.
 
 `/etc` is an allowlist over a tmpfs: only the entries in `ETC_ALLOWLIST`
-(`crates/bubbler-core/src/bwrap.rs`) are bound, and only those that exist on
+(`crates/bubbler-plan/src/bwrap.rs`) are bound, and only those that exist on
 the host — `ld.so.cache`, `ld.so.conf`, `ld.so.conf.d`, `fonts`, `localtime`,
 `machine-id`, `nsswitch.conf`, `hosts`, `host.conf`, `ssl`, `ca-certificates`,
 `mime.types`, `xdg`, `gtk-3.0`, `gtk-4.0`, `pulse`, `pipewire`, `alsa`,
