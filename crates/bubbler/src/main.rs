@@ -27,6 +27,7 @@ use bubbler_core::error::{ConfigError, LaunchError};
 use bubbler_core::exec;
 use bubbler_core::explain;
 use bubbler_core::forward;
+use bubbler_core::forward_register;
 use bubbler_core::host::RealHost;
 use bubbler_core::instance::{self, Instance};
 use bubbler_core::instance_ops;
@@ -1063,7 +1064,8 @@ fn forwarded_or(
         // portal has answered: a failed call leaves it half-read.
         match portal_session(env) {
             Ok(mut session) => {
-                let answers = forward::register(env, &inst.name, &candidates, &mut session);
+                let answers =
+                    forward_register::register(env, &inst.name, &candidates, &mut session);
                 for (candidate, answer) in candidates.iter().zip(answers) {
                     match answer {
                         Ok(forward) => forwards.push(forward),

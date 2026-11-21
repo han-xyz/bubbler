@@ -4,7 +4,7 @@ pub mod dbus_a11y;
 pub mod dbus_session;
 pub mod desktop_ops;
 pub mod exec;
-pub mod forward;
+pub mod forward_register;
 pub mod fsutil;
 pub mod instance_ops;
 pub mod launcher;

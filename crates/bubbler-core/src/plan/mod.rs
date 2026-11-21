@@ -5,6 +5,7 @@ pub mod dbus;
 pub mod dbus_wire;
 pub mod desktop;
 pub mod explain;
+pub mod forward;
 pub mod host;
 pub mod init_bin;
 pub mod lint;
