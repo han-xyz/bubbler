@@ -1,0 +1,4087 @@
+//! Static checks over a profile or an instance config: what the file
+//! grants, measured against what a sandbox is meant to give away.
+//!
+//! Findings are read off each layer's KDL rather than the flattened
+//! result, so every one of them names the file and line that has to
+//! change. Errors say the file will not do what it says; warnings say it
+//! grants more than it probably means to and can be accepted with a
+//! `lint-allow` node; notes are for information and fail nothing.
+
+use std::ffi::{OsStr, OsString};
+use std::os::unix::fs::FileTypeExt;
+use std::path::{Path, PathBuf};
+
+use kdl::{KdlDocument, KdlNode};
+
+use crate::audio_policy::{self, LoadedRevision};
+use crate::config::{self, BusRule, name_covers};
+use crate::dbus;
+use crate::desktop;
+use crate::env::{Env, SANDBOX_HOME};
+use crate::error::{LintError, ReadError};
+use crate::host::Host;
+use crate::json;
+use crate::network::HostPattern;
+use crate::profile::Resolver;
+use crate::service;
+
+use crate::checks::{
+    ALLOW_HOST_WILDCARD, APP_ID_SHARED, APP_RUNTIME_RW, AUDIO_DEVICES_OFFERED,
+    AUDIO_POLICY_DIFFERS, AUDIO_POLICY_MISSING, AUDIO_POLICY_NOT_LOADED,
+    AUDIO_POLICY_NOT_LOADED_UNKNOWN, BUNDLE_WITHOUT_DBUS, CAMERA_NODES_NO_HOTPLUG,
+    CAMERA_NODES_NONE_PRESENT, CAMERA_WITHOUT_PORTALS, COMMAND_NOT_FOUND, DBUS_NAME_IS_HOST_EXEC,
+    DBUS_NAME_IS_RISKY, DBUS_WITHOUT_RULES, DESKTOP_ENTRY_MISSING, DRI_KMS, DRI_NVIDIA_PRIMARY,
+    DUP_NAME_POLICY, ENV_LOOKS_SECRET, ETC_HOST, HOME_SHARE_RESERVED, HOME_SHARE_SENSITIVE,
+    LINT_ALLOW_UNUSED, MPRIS_WILDCARD, NETWORK_HOST, OUTBOUND_DENY, OWN_ON_SYSTEM_BUS,
+    OWN_TOO_WIDE, OZONE_HINT_UNNECESSARY, PATH_SHARE_MOUNTPOINT, PATH_SHARE_RESERVED,
+    PATH_SHARE_SOCKET, PIPEWIRE_MICROPHONE, PORTAL_TALK_WITHOUT_PORTALS, REPEAT_OUTSIDE_BLOCK,
+    SECCOMP_DISABLED, SECRETS_ACCESS, SHARE_SOURCE_MISSING, SYSTEM_BUS_POLKIT_NAME,
+    TTY_PASSTHROUGH, TTY_PASSTHROUGH_WITHOUT_SECCOMP, USERNS_DISABLED_WITH_NESTED_SANDBOX,
+    WAYLAND_CLIPBOARD_OPEN, WAYLAND_HOST, X11_NESTED_NO_WM, X11_WITHOUT_REASON,
+};
+pub use crate::checks::{CHECKS, Check, Severity, check};
+
+/// Where a finding was written: a file, or a profile compiled in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Where {
+    /// A profile or `config.kdl` on disk.
+    File(PathBuf),
+    /// A built-in profile, which has no path to name.
+    BuiltIn(String),
+}
+
+impl Where {
+    /// How a finding line starts: the path, or `built-in:<name>`. Not a
+    /// `String`, because a profile path need not be UTF-8.
+    pub fn label(&self) -> OsString {
+        match self {
+            Self::File(p) => p.clone().into_os_string(),
+            Self::BuiltIn(name) => OsString::from(format!("built-in:{name}")),
+        }
+    }
+}
+
+/// One thing a check found, and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finding {
+    /// The layer that holds the node.
+    pub at: Where,
+    /// 1-based line of the node, absent for a built-in layer.
+    pub line: Option<u32>,
+    /// 1-based column of the node, absent for a built-in layer.
+    pub col: Option<u32>,
+    /// What the finding weighs.
+    pub severity: Severity,
+    /// Id of the check that reported it.
+    pub id: &'static str,
+    /// What is wrong, in one sentence.
+    pub message: String,
+    /// What to do about it. Every check carries one: a finding a reader
+    /// cannot act on is one they route around.
+    pub help: String,
+}
+
+/// The result of one lint run.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Report {
+    /// Findings in layer order, then file order within a layer.
+    pub findings: Vec<Finding>,
+    /// The layers that were read, in the order they were read.
+    pub layers: Vec<Where>,
+}
+
+impl Report {
+    /// How many findings of `severity` the run reported.
+    pub fn count(&self, severity: Severity) -> usize {
+        self.findings
+            .iter()
+            .filter(|f| f.severity == severity)
+            .count()
+    }
+
+    /// Fold another report into this one, as `profile lint --all` does.
+    /// Two profiles that `include` one base read that base twice, so both
+    /// the layer and anything found in it are counted once.
+    pub fn absorb(&mut self, other: Report) {
+        for layer in other.layers {
+            if !self.layers.contains(&layer) {
+                self.layers.push(layer);
+            }
+        }
+        for finding in other.findings {
+            let seen = self.findings.iter().any(|f| {
+                (&f.at, f.line, f.col, f.id) == (&finding.at, finding.line, finding.col, finding.id)
+            });
+            if !seen {
+                self.findings.push(finding);
+            }
+        }
+    }
+}
+
+/// What the checks need besides the file: the host tree they probe, the
+/// home a `home-share` is relative to, and the directories a `command` is
+/// looked for in.
+pub struct Context<'a> {
+    /// Host-side facts, for `$HOME` and the reserved `path-share` roots.
+    pub env: &'a Env,
+    /// Filesystem the share and socket checks probe.
+    pub host: &'a dyn Host,
+    /// `$PATH` split into directories, for `command-not-found`.
+    pub search_path: &'a [PathBuf],
+    /// `crate::audio_policy_ask::loaded_revision` outside the tests; asked only of a config with
+    /// an audio grant and the whole policy installed.
+    pub loaded_revision: &'a dyn Fn(&Env) -> LoadedRevision,
+    /// The other instance whose portal app id the linted instance's is, for `app-id-shared`;
+    /// `None` for a profile.
+    pub app_id_twin: Option<&'a str>,
+}
+
+// Commands known to start a sandbox of their own inside this one, which
+// takes a user namespace. A heuristic list, and the message says so.
+const NESTERS: &[&str] = &[
+    "chromium",
+    "chrome",
+    "code",
+    "codium",
+    "vesktop",
+    "discord",
+    "steam",
+    "lutris",
+    "firefox",
+    "thunderbird",
+    "obsidian",
+    "signal-desktop",
+];
+
+// Home directories the private home exists to keep out, together with everything under them: one
+// key file out of `.ssh` is the key. firejail blacklists the same set for every profile it ships.
+const SENSITIVE_TREE: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".pki",
+    ".password-store",
+    ".local/share/keyrings",
+    ".mozilla",
+];
+
+// Home directories that are sensitive whole and not one subdirectory at a time: they hold every
+// application's state.
+const SENSITIVE_ROOT: &[&str] = &[".config", ".local", ".local/share", ".cache"];
+
+// System-bus names whose interesting methods are behind an `auth_admin` polkit action, which polkit
+// judges against the proxy's credentials — that is, against the user.
+const POLKIT_NAMES: &[&str] = &[
+    "org.freedesktop.UDisks2",
+    "org.freedesktop.NetworkManager",
+    "org.freedesktop.systemd1",
+    "org.freedesktop.PackageKit",
+    "org.freedesktop.login1",
+    "org.freedesktop.hostname1",
+    "org.freedesktop.timedate1",
+];
+
+// Underscore-separated words that make an environment variable name look like a credential. Whole
+// segments, not substrings: `GITHUB_TOKEN` is one and `TOKENIZERS_PARALLELISM` is not.
+const SECRET_SEGMENTS: &[&str] = &[
+    "TOKEN",
+    "TOKENS",
+    "SECRET",
+    "SECRETS",
+    "PASSWORD",
+    "PASSWD",
+    "APIKEY",
+    "CREDENTIAL",
+    "CREDENTIALS",
+    "PAT",
+];
+
+// Pairs of segments that mean the same as one of `SECRET_SEGMENTS`.
+const SECRET_PAIRS: &[[&str; 2]] = &[["API", "KEY"], ["ACCESS", "KEY"], ["SECRET", "KEY"]];
+
+const SECRET_VALUES: &[&str] = &["ghp_", "sk-", "AKIA"];
+
+// The Secret Service name: one session-bus name for every secret the login keyring holds, with no
+// partitioning between applications.
+const SECRETS_NAME: &str = "org.freedesktop.secrets";
+
+// Session- and system-bus names that are a way to run a command outside the sandbox. A trailing
+// `.*` here is a family; a rule naming any member matches.
+const HOST_EXEC_NAMES: &[&str] = &[
+    "org.freedesktop.systemd1",
+    "org.freedesktop.Flatpak",
+    "org.freedesktop.impl.portal.*",
+    "ca.desrt.dconf",
+];
+
+const RISKY_NAMES: &[(&str, &str)] = &[
+    (
+        "org.kde.KWin",
+        "the KWin compositor's own bus name: window management, scripting and \
+         screen capture for the whole session",
+    ),
+    (
+        "org.gnome.Shell",
+        "the GNOME shell's own bus name: extensions, the screenshot and \
+         screencast interfaces, and `Eval` where it is built in",
+    ),
+    (
+        "org.freedesktop.FileManager1",
+        "the session's file manager: the sandbox can have it open any host \
+         path in a window of yours",
+    ),
+    (
+        SECRETS_NAME,
+        "the Secret Service API, which is the whole login keyring with no \
+         partitioning between the applications that call it",
+    ),
+];
+
+// Read across both buses because the proxy is one process and the names mean the same thing on
+// either.
+fn bus_names(i: usize, source: &Source, f: &mut Findings) {
+    for (_, rule) in bus_rules(source) {
+        let level = rule.name().value();
+        if !matches!(level, "see" | "talk" | "own" | "call" | "broadcast") {
+            continue;
+        }
+        let Some(name) = rule_name(rule) else {
+            continue;
+        };
+        if HOST_EXEC_NAMES.iter().any(|l| name_covers(name, l)) {
+            f.push(
+                i,
+                rule,
+                &DBUS_NAME_IS_HOST_EXEC,
+                format!(
+                    "`{level} \"{name}\"` reaches a bus name that runs code outside the \
+                     sandbox, so the grant is not a wider sandbox but no sandbox"
+                ),
+                "drop the rule; if the app needs one method of it, there is no narrower \
+                 form that helps — the name itself is the escape",
+            );
+        }
+        if let Some((_, what)) = RISKY_NAMES.iter().find(|(l, _)| name_covers(name, l)) {
+            f.push(
+                i,
+                rule,
+                &DBUS_NAME_IS_RISKY,
+                format!("`{level} \"{name}\"` is {what}"),
+                "drop the rule, narrow it to the one method the app needs with \
+                 `call \"<name>=<interface>.<method>@<path>\"`, or accept it with \
+                 `lint-allow \"dbus-name-is-risky\" reason=\"...\"`",
+            );
+        }
+    }
+}
+
+const PORTAL_NAMES: &str = "org.freedesktop.portal.*";
+
+// The nodes the proxy carries: rules on the session bus, or on the
+// accessibility bus the same proxy serves.
+const BUNDLES: &[&str] = &["portals", "notify", "tray", "mpris", "a11y", "input-method"];
+
+// Checks that name exactly what the parser or the resolver refuses. A report whose errors are all
+// from this set has already said why the config does not parse, so the run is a verdict.
+const PARSER_EQUIVALENT: &[&str] = &[
+    BUNDLE_WITHOUT_DBUS.id,
+    CAMERA_WITHOUT_PORTALS.id,
+    DUP_NAME_POLICY.id,
+    OWN_ON_SYSTEM_BUS.id,
+];
+
+// No errors at all explain nothing.
+fn explains_a_parse_failure(report: &Report) -> bool {
+    let mut errors = report
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::Error)
+        .peekable();
+    errors.peek().is_some() && errors.all(|f| PARSER_EQUIVALENT.contains(&f.id))
+}
+
+/// Lint one profile, resolved through its layers and `include`s. The flattened profile is resolved
+/// too, so a layer that does not parse and no check explains is a failed run rather than a clean
+/// report.
+pub fn lint_profile(ctx: &Context, resolver: &Resolver, name: &str) -> Result<Report, LintError> {
+    let layers = resolver.layers(name)?;
+    let mut sources = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let at = match &layer.path {
+            Some(p) => Where::File(p.clone()),
+            None => Where::BuiltIn(layer.name.clone()),
+        };
+        sources.push(Source::read(at, layer.text)?);
+    }
+    let report = run(ctx, &sources);
+    if !explains_a_parse_failure(&report) {
+        resolver.resolve(name)?;
+    }
+    Ok(report)
+}
+
+/// Lint one `config.kdl`, which has a single layer and no `include`s.
+pub fn lint_config(ctx: &Context, path: &Path) -> Result<Report, LintError> {
+    let text = config::read_bounded(path).map_err(|e| match e {
+        ReadError::Io(e) => LintError::Io(path.to_path_buf(), e),
+        ReadError::TooLarge(e) => LintError::Config(e),
+    })?;
+    lint_text(ctx, Where::File(path.to_path_buf()), text)
+}
+
+/// Lint one config already in hand, which is what an editor holding an unsaved buffer has. A file
+/// the parser rejects is a failed run rather than a clean report, unless a check already said what
+/// is wrong with it.
+pub fn lint_text(ctx: &Context, at: Where, text: String) -> Result<Report, LintError> {
+    let source = Source::read(at, text)?;
+    let report = run(ctx, std::slice::from_ref(&source));
+    if !explains_a_parse_failure(&report) {
+        config::parse(&source.text)?;
+    }
+    Ok(report)
+}
+
+/// Exit code for a report: 0 clean, 1 warnings, 2 errors. `deny_warnings`
+/// turns 1 into 2, which is what a CI job asks for. A run that could not
+/// be made at all is 3, and that is the caller's `LintError`.
+pub fn exit_code(report: &Report, deny_warnings: bool) -> i32 {
+    if report.count(Severity::Error) > 0 {
+        return 2;
+    }
+    if report.count(Severity::Warning) > 0 {
+        return if deny_warnings { 2 } else { 1 };
+    }
+    0
+}
+
+/// One finding as the lines it prints: the finding itself and its help.
+/// `OsString` because a layer is named by its path.
+pub fn render_finding(f: &Finding) -> Vec<OsString> {
+    let mut line = f.at.label();
+    if let (Some(l), Some(c)) = (f.line, f.col) {
+        line.push(format!(":{l}:{c}"));
+    }
+    line.push(format!(": {}[{}]: {}", f.severity, f.id, f.message));
+    vec![line, OsString::from(format!("  help: {}", f.help))]
+}
+
+/// The whole text report: every finding, then a blank line and a summary.
+pub fn render_text(report: &Report) -> Vec<OsString> {
+    let mut out: Vec<OsString> = report.findings.iter().flat_map(render_finding).collect();
+    if !out.is_empty() {
+        out.push(OsString::new());
+    }
+    out.push(OsString::from(summary(report)));
+    out
+}
+
+/// `N layers linted, E errors, W warnings, K notes`.
+pub fn summary(report: &Report) -> String {
+    format!(
+        "{}, {}, {}, {}",
+        plural(report.layers.len(), "layer linted", "layers linted"),
+        plural(report.count(Severity::Error), "error", "errors"),
+        plural(report.count(Severity::Warning), "warning", "warnings"),
+        plural(report.count(Severity::Note), "note", "notes"),
+    )
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// The report as JSON: one object per finding, then a summary object.
+/// Paths go through `to_string_lossy`, since JSON is UTF-8 and this is a
+/// report rather than the argv audit trail `--dry-run` prints.
+pub fn render_json(report: &Report) -> String {
+    let mut out = String::from("[\n");
+    for f in &report.findings {
+        out.push_str("  {\"file\": ");
+        out.push_str(&json::string(&f.at.label().to_string_lossy()));
+        out.push_str(&format!(
+            ", \"line\": {}, \"col\": {}, \"severity\": {}, \"check\": {}, \"message\": {}, \"help\": {}}},\n",
+            f.line.map_or_else(|| "null".to_owned(), |l| l.to_string()),
+            f.col.map_or_else(|| "null".to_owned(), |c| c.to_string()),
+            json::string(&f.severity.to_string()),
+            json::string(f.id),
+            json::string(&f.message),
+            json::string(&f.help),
+        ));
+    }
+    out.push_str(&format!(
+        "  {{\"layers\": {}, \"errors\": {}, \"warnings\": {}, \"notes\": {}}}\n]\n",
+        report.layers.len(),
+        report.count(Severity::Error),
+        report.count(Severity::Warning),
+        report.count(Severity::Note),
+    ));
+    out
+}
+
+struct Source {
+    at: Where,
+    text: String,
+    doc: KdlDocument,
+    // Every check but `repeat-outside-block` reads this: a check that saw only the line form would
+    // ignore half of a block-form config.
+    flat: Vec<KdlNode>,
+}
+
+impl Source {
+    fn read(at: Where, text: String) -> Result<Self, LintError> {
+        let doc = config::parse_document(&text)?;
+        let mut flat = Vec::new();
+        for node in doc.nodes() {
+            // A block the config parser refuses is read here as the node it is: the refusal comes
+            // back from the resolve that follows the lint.
+            match config::parse_repeatable_block(node) {
+                Ok(Some(lines)) => flat.extend(lines),
+                Ok(None) | Err(_) => {
+                    flat.push(node.clone());
+                    // The config parser splits a `portals` block's `camera` child into the same
+                    // `Service::Camera` a bare `camera` node parses to, so the checks that read a
+                    // `camera` see it in either form. The `portals` node stays in the list, which
+                    // is what keeps `camera-without-portals` silent for the child.
+                    if node.name().value() == "portals" {
+                        flat.extend(kids(node).filter(|c| c.name().value() == "camera").cloned());
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            at,
+            text,
+            doc,
+            flat,
+        })
+    }
+
+    // A file written with carriage returns is one line to `str::lines` and many to the parser, and
+    // a finding has to point where the parser's own refusals do.
+    fn position(&self, offset: usize) -> (Option<u32>, Option<u32>) {
+        if matches!(self.at, Where::BuiltIn(_)) {
+            return (None, None);
+        }
+        // A span past the end would panic the slice; `min` keeps a
+        // document the parser rewrote from taking the run down with it.
+        let before = &self.text[..offset.min(self.text.len())];
+        let b = before.as_bytes();
+        let (mut line, mut col) = (1u32, 1u32);
+        let mut i = 0;
+        while i < b.len() {
+            if let Some(n) = config::newline_len(b, i) {
+                line = line.saturating_add(1);
+                col = 1;
+                i += n;
+                continue;
+            }
+            // One column per character, so a multi-byte one is one step.
+            i += 1;
+            while i < b.len() && !before.is_char_boundary(i) {
+                i += 1;
+            }
+            col = col.saturating_add(1);
+        }
+        (Some(line), Some(col))
+    }
+}
+
+// `offset` orders the findings of one layer the way the file reads.
+struct Pending {
+    layer: usize,
+    offset: usize,
+    check: &'static Check,
+    message: String,
+    help: String,
+}
+
+#[derive(Default)]
+struct Findings(Vec<Pending>);
+
+impl Findings {
+    fn push(
+        &mut self,
+        layer: usize,
+        node: &KdlNode,
+        check: &'static Check,
+        message: String,
+        help: &str,
+    ) {
+        self.0.push(Pending {
+            layer,
+            offset: node.name().span().offset(),
+            check,
+            message,
+            help: help.to_owned(),
+        });
+    }
+}
+
+// Run every check over `sources`, which are in merge order, and drop the warnings and notes a
+// `lint-allow` node accepted.
+fn run(ctx: &Context, sources: &[Source]) -> Report {
+    let mut f = Findings::default();
+    // Read across the layers, since the node a per-layer finding depends on may be written in
+    // another file than the node it is about. The last layer that names the mode is the one the
+    // merge keeps.
+    let host_net = last(sources, "network").is_some_and(|(_, n)| arg(n) == Some("host"));
+    for (i, source) in sources.iter().enumerate() {
+        per_layer(ctx, i, source, host_net, &mut f);
+    }
+    across_layers(ctx, sources, &mut f);
+    audio_policy_missing(ctx, sources, &mut f);
+    audio_policy_differs(ctx, sources, &mut f);
+    audio_policy_not_loaded(ctx, sources, &mut f);
+    app_id_shared(ctx, &mut f);
+    let allowed: Vec<&str> = sources
+        .iter()
+        .flat_map(|s| top(s, "lint-allow"))
+        .filter_map(arg)
+        .collect();
+    unused_allows(sources, &mut f);
+    let mut items = f.0;
+    items.sort_by_key(|p| (p.layer, p.offset));
+    let findings = items
+        .into_iter()
+        .filter_map(|p| {
+            // A `lint-allow` that accepts nothing cannot be accepted
+            // away: the node doing the accepting would be the unused one.
+            if p.check.severity != Severity::Error
+                && p.check.id != LINT_ALLOW_UNUSED.id
+                && allowed.contains(&p.check.id)
+            {
+                return None;
+            }
+            let source = &sources[p.layer];
+            let (line, col) = source.position(p.offset);
+            Some(Finding {
+                at: source.at.clone(),
+                line,
+                col,
+                severity: p.check.severity,
+                id: p.check.id,
+                message: p.message,
+                help: p.help,
+            })
+        })
+        .collect();
+    Report {
+        findings,
+        layers: sources.iter().map(|s| s.at.clone()).collect(),
+    }
+}
+
+// Read from the findings collected so far, which is why this runs last.
+fn unused_allows(sources: &[Source], f: &mut Findings) {
+    let silenced: Vec<&'static str> =
+        f.0.iter()
+            .filter(|p| p.check.severity != Severity::Error)
+            .map(|p| p.check.id)
+            .collect();
+    for (i, source) in sources.iter().enumerate() {
+        for node in top(source, "lint-allow") {
+            let Some(id) = arg(node) else {
+                continue;
+            };
+            if silenced.contains(&id) {
+                continue;
+            }
+            f.push(
+                i,
+                node,
+                &LINT_ALLOW_UNUSED,
+                format!("`lint-allow \"{id}\"` accepts nothing: no layer reports `{id}`"),
+                "drop the node; a suppression that silences nothing outlives what it was \
+                 written for",
+            );
+        }
+    }
+}
+
+fn top<'a>(source: &'a Source, name: &str) -> Vec<&'a KdlNode> {
+    source
+        .flat
+        .iter()
+        .filter(|n| n.name().value() == name)
+        .collect()
+}
+
+// The two proxies are separate filters, so a rule is never read outside the bus that carries it.
+fn bus_rules(source: &Source) -> Vec<(&'static str, &KdlNode)> {
+    let mut out = Vec::new();
+    for bus in ["dbus", "system-bus"] {
+        for node in top(source, bus) {
+            out.extend(kids(node).map(|r| (bus, r)));
+        }
+    }
+    out
+}
+
+fn undoes_portals(node: &KdlNode) -> bool {
+    let Some(a) = arg(node) else {
+        return false;
+    };
+    let rule = match node.name().value() {
+        "talk" => BusRule::Talk(a.to_owned()),
+        "own" => BusRule::Own(a.to_owned()),
+        "call" => match a.split_once('=') {
+            Some((name, r)) => BusRule::Call(name.to_owned(), r.to_owned()),
+            None => return false,
+        },
+        _ => return false,
+    };
+    config::reaches_every_portal(&rule)
+}
+
+// The last layer that writes a `name` node, and that node: the merge keeps that one, so a finding
+// about it belongs to that layer and not to the layer it overrode.
+fn last<'a>(sources: &'a [Source], name: &str) -> Option<(usize, &'a KdlNode)> {
+    sources
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, s)| top(s, name).last().map(|n| (i, *n)))
+}
+
+fn kids(node: &KdlNode) -> impl Iterator<Item = &KdlNode> {
+    node.children().into_iter().flat_map(KdlDocument::nodes)
+}
+
+fn arg(node: &KdlNode) -> Option<&str> {
+    node.entries()
+        .iter()
+        .find(|e| e.name().is_none())
+        .and_then(|e| e.value().as_string())
+}
+
+fn network_node(i: usize, node: &KdlNode, f: &mut Findings) {
+    if kids(node).any(|c| c.name().value() == "outbound" && arg(c) == Some("deny")) {
+        // What the filter leaves open depends on whether a name is in it: an `allow-host` moves the
+        // resolver behind the proxy's cgroup.
+        let (message, help) = if kids(node).any(|c| c.name().value() == "allow-host") {
+            (
+                "`outbound \"deny\"` with `allow-host`: the sandbox reaches the \
+                 names listed here through bubbler's proxy, the `allow-out` \
+                 addresses directly, its own loopback, and nothing else — and it \
+                 resolves nothing itself, the resolver being the proxy's too",
+                "a name policy the proxy enforces rather than a rule of the \
+                 ruleset, which accepts that one process: an application that \
+                 ignores `HTTPS_PROXY` fails at the name lookup rather than at \
+                 the connection",
+            )
+        } else {
+            (
+                "`outbound \"deny\"` filters by address: the sandbox reaches its \
+                 resolver, its own loopback and the `allow-out` destinations, and \
+                 nothing else",
+                "an address policy, not a name one — a host that answers with a \
+                 different address, as a CDN does, is refused by the sandbox's own \
+                 firewall rather than by the peer; `allow-host` is the same policy \
+                 written by name, through a proxy",
+            )
+        };
+        f.push(i, node, &OUTBOUND_DENY, message.to_owned(), help);
+    }
+    for child in kids(node).filter(|c| c.name().value() == "allow-host") {
+        // A name the parser refuses is a config error already, and this
+        // check has nothing to say about one.
+        let Some(pattern) = arg(child).and_then(|s| HostPattern::parse(s).ok()) else {
+            continue;
+        };
+        if pattern.wildcard && pattern.labels.len() == 1 {
+            f.push(
+                i,
+                child,
+                &ALLOW_HOST_WILDCARD,
+                format!(
+                    "`allow-host \"{pattern}\"` is a wildcard directly under a top-level \
+                     domain: every name anyone registers under `{}` is reachable",
+                    pattern.labels.join(".")
+                ),
+                "name the hosts the application needs, or keep the wildcard under a \
+                 name whose registrations you know",
+            );
+        }
+    }
+}
+
+// `host_net` is whether the merged config puts the sandbox on the host's network namespace, which
+// decides whether a uevent about a camera plugged in later can reach it at all.
+fn camera_nodes(ctx: &Context, i: usize, node: &KdlNode, host_net: bool, f: &mut Findings) {
+    let dev = Path::new("/dev");
+    let present = ctx.host.list_dir(dev).into_iter().any(|name| {
+        let bytes = name.as_encoded_bytes();
+        (bytes.starts_with(b"video") || bytes.starts_with(b"media"))
+            && ctx
+                .host
+                .file_type(&dev.join(&name))
+                .is_some_and(|t| t.is_char_device())
+    });
+    if !present {
+        f.push(
+            i,
+            node,
+            &CAMERA_NODES_NONE_PRESENT,
+            "`camera nodes=#true` and this host has no `/dev/video*` or `/dev/media*` node, \
+             so the device half of the grant binds nothing"
+                .to_owned(),
+            "the portal half needs no node in the sandbox; drop `nodes=#true` unless the \
+             application is a plain V4L2 client",
+        );
+    }
+    // The uevent half holds only where the namespace does. The frozen list is what stays true under
+    // either mode.
+    let unheard = match host_net {
+        true => "",
+        false => {
+            ", and with a network namespace of its own the sandbox is never told \
+                  about one either"
+        }
+    };
+    f.push(
+        i,
+        node,
+        &CAMERA_NODES_NO_HOTPLUG,
+        format!(
+            "`camera nodes=#true` binds the nodes this host has at launch: a camera \
+             plugged in later has no node inside{unheard}"
+        ),
+        "restart the instance after plugging a camera in; the portal half follows hotplug \
+         in the host daemon instead",
+    );
+}
+
+fn prop<'a>(node: &'a KdlNode, key: &str) -> Option<&'a str> {
+    node.entries()
+        .iter()
+        .find(|e| e.name().is_some_and(|n| n.value() == key))
+        .and_then(|e| e.value().as_string())
+}
+
+// A fullscreen server has the one window there is nothing to arrange in, and `wm=` names the
+// program that arranges the rest.
+fn x11_manages_its_windows(node: &KdlNode) -> bool {
+    flag(node, "fullscreen") == Some(true) || prop(node, "wm").is_some()
+}
+
+fn flag(node: &KdlNode, key: &str) -> Option<bool> {
+    node.entries()
+        .iter()
+        .find(|e| e.name().is_some_and(|n| n.value() == key))
+        .and_then(|e| e.value().as_bool())
+}
+
+// The bus name a rule child names: the whole argument for a policy rule,
+// the part before `=` for `call` and `broadcast`.
+fn rule_name(node: &KdlNode) -> Option<&str> {
+    let a = arg(node)?;
+    match node.name().value() {
+        "call" | "broadcast" => a.split('=').next(),
+        _ => Some(a),
+    }
+}
+
+// `name` is `node`'s own name, since `pipewire` and `pulseaudio` share this wording and differ only
+// in which one is being named.
+fn microphone_note(i: usize, node: &KdlNode, name: &str, f: &mut Findings) {
+    if kids(node).any(|c| c.name().value() == "microphone") {
+        f.push(
+            i,
+            node,
+            &PIPEWIRE_MICROPHONE,
+            format!(
+                "`{name} {{ microphone }}` adds every microphone and line-in the session has, \
+                 and capture from them"
+            ),
+            "drop the child where the app only plays",
+        );
+    }
+}
+
+fn devices_note(i: usize, node: &KdlNode, f: &mut Findings) {
+    if kids(node).any(|c| c.name().value() == "devices") {
+        f.push(
+            i,
+            node,
+            &AUDIO_DEVICES_OFFERED,
+            "`pipewire { devices }` treats the instance's sinks and sources like the \
+             host's: it hears whatever is routed into the devices it offers, and one of \
+             them may become the session's default"
+                .to_owned(),
+            "drop the child unless the application exists to offer audio devices",
+        );
+    }
+}
+
+// `pipewire` and `pulseaudio` share one instance-wide audio reach, so this is called once per run
+// over every layer rather than once per node; a config granting both gets one finding, not two.
+fn audio_policy_missing(ctx: &Context, sources: &[Source], f: &mut Findings) {
+    let Some(case) = audio_policy::missing(ctx.host, ctx.env) else {
+        return;
+    };
+    let Some((i, node, name)) = audio_node(sources) else {
+        return;
+    };
+    let dirs = audio_policy::install_dirs(ctx.env);
+    let hook_dirs = audio_policy::hook_dirs(ctx.env);
+    let drop_in = format!(
+        "no WirePlumber policy drop-in ({}) is installed in {}",
+        audio_policy::DROP_IN_NAME,
+        dirs.iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    let hook = format!(
+        "no policy hook script ({}) is installed in {}",
+        audio_policy::HOOK_NAME,
+        hook_dirs
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    // The hook is the half that decides links, so its absence leaves the grant scoped and the
+    // output mix still readable; without the drop-in nothing is scoped at all.
+    let message = match case {
+        audio_policy::Missing::DropIn => format!(
+            "{drop_in}: this `{name}` grant reaches every PipeWire node instead of what it \
+             asks for — microphone and every other client's audio included"
+        ),
+        audio_policy::Missing::Hook => format!(
+            "{hook}: this `{name}` grant is scoped, but every other client's audio stays \
+             recordable — a capture stream reaches another client's stream or the sink's \
+             monitor ports, and the sandbox can make those links itself"
+        ),
+        audio_policy::Missing::Both => format!(
+            "{drop_in}, and {hook}: this `{name}` grant reaches every PipeWire node instead \
+             of what it asks for — microphone and every other client's audio included"
+        ),
+    };
+    let write_drop_in = format!(
+        "bubbler audio-policy --print > {}",
+        dirs[0].join(audio_policy::DROP_IN_NAME).display()
+    );
+    let script = hook_dirs[0].join(audio_policy::HOOK_NAME);
+    let write_hook = format!(
+        "mkdir -p {} && bubbler audio-policy --print --script > {}",
+        script
+            .parent()
+            .expect("the hook's name has a directory in it")
+            .display(),
+        script.display()
+    );
+    let help = match case {
+        audio_policy::Missing::DropIn => {
+            format!("install it with `{write_drop_in}` and restart WirePlumber")
+        }
+        audio_policy::Missing::Hook => {
+            format!("install it with `{write_hook}` and restart WirePlumber")
+        }
+        audio_policy::Missing::Both => format!(
+            "install them with `{write_drop_in}` and `{write_hook}`, then restart WirePlumber"
+        ),
+    };
+    f.push(i, node, &AUDIO_POLICY_MISSING, message, &help);
+}
+
+fn app_id_shared(ctx: &Context, f: &mut Findings) {
+    let Some(other) = ctx.app_id_twin else {
+        return;
+    };
+    f.0.push(Pending {
+        layer: 0,
+        offset: 0,
+        check: &APP_ID_SHARED,
+        message: format!(
+            "this instance shares the portal app id `{}` with instance `{other}`, and with it \
+             portal permissions, forwarded documents and the window app id",
+            dbus::app_id(other)
+        ),
+        help: format!(
+            "rename one of the two while neither runs: move its directory under the instances \
+             directory, run `bubbler lint` on the new name, and redo its `wrap` and `desktop` \
+             entries, which name the old one; or accept it with `lint-allow \"{}\" reason=\"...\"`",
+            APP_ID_SHARED.id
+        ),
+    });
+}
+
+// The `audio-policy-differs` warning: a copy of the policy WirePlumber
+// loads is not this binary's, whether or not the other half is there.
+fn audio_policy_differs(ctx: &Context, sources: &[Source], f: &mut Findings) {
+    let paths = audio_policy::differing(ctx.host, ctx.env);
+    if paths.is_empty() {
+        return;
+    }
+    let Some((i, node, _)) = audio_node(sources) else {
+        return;
+    };
+    f.push(
+        i,
+        node,
+        &AUDIO_POLICY_DIFFERS,
+        audio_policy::differs_message(&paths),
+        &audio_policy::differs_help(&paths, ctx.env),
+    );
+}
+
+fn audio_policy_not_loaded(ctx: &Context, sources: &[Source], f: &mut Findings) {
+    let differs_accepted = sources
+        .iter()
+        .flat_map(|s| top(s, "lint-allow"))
+        .filter_map(arg)
+        .any(|id| id == audio_policy::DIFFERS_CHECK);
+    if audio_policy::held_back(differs_accepted, ctx.host, ctx.env) {
+        return;
+    }
+    let Some((i, node, name)) = audio_node(sources) else {
+        return;
+    };
+    let restart = format!("`{}`", audio_policy::RESTART);
+    let loaded = (ctx.loaded_revision)(ctx.env);
+    if let LoadedRevision::Unknown(reason) = &loaded {
+        f.push(
+            i,
+            node,
+            &AUDIO_POLICY_NOT_LOADED_UNKNOWN,
+            format!(
+                "whether the running WirePlumber has loaded this bubbler's audio policy is \
+                 not known: {reason}"
+            ),
+            &format!(
+                "with PipeWire and WirePlumber running in this session, lint again; {restart} \
+                 loads the installed policy"
+            ),
+        );
+        return;
+    }
+    if let Some(cause) = loaded.unverified() {
+        f.push(
+            i,
+            node,
+            &AUDIO_POLICY_NOT_LOADED,
+            format!("{cause}: whether this `{name}` grant is enforced as configured is not known"),
+            &format!(
+                "`pw-dump` shows what was read, a client that made it too large or cut it short \
+                 included; {restart} loads the installed policy"
+            ),
+        );
+        return;
+    }
+    let Some(cause) = loaded.not_loaded() else {
+        return;
+    };
+    f.push(
+        i,
+        node,
+        &AUDIO_POLICY_NOT_LOADED,
+        format!("{cause}: this `{name}` grant is not enforced as configured"),
+        &format!("run {restart}, which loads the installed policy"),
+    );
+}
+
+fn audio_node(sources: &[Source]) -> Option<(usize, &KdlNode, &str)> {
+    sources.iter().enumerate().find_map(|(i, s)| {
+        s.flat
+            .iter()
+            .find(|n| matches!(n.name().value(), "pipewire" | "pulseaudio"))
+            .map(|n| (i, n, n.name().value()))
+    })
+}
+
+// Checks that need one layer and nothing else, apart from `host_net`: the merged mode a `camera`
+// message reads differently under.
+fn per_layer(ctx: &Context, i: usize, source: &Source, host_net: bool, f: &mut Findings) {
+    bus_names(i, source, f);
+    repeat_outside_block(i, source, f);
+    for node in &source.flat {
+        match node.name().value() {
+            "x11" if arg(node) == Some("host") => f.push(
+                i,
+                node,
+                &X11_WITHOUT_REASON,
+                "`x11 \"host\"` hands over the session X socket: every X client can read \
+                 every other's input and windows, Xwayland included, and the compositor's \
+                 security context does not apply"
+                    .to_owned(),
+                "drop the argument for a nested Xwayland inside the sandbox, or accept it \
+                 with `lint-allow \"x11-without-reason\" reason=\"...\"`",
+            ),
+            "x11" if !x11_manages_its_windows(node) => f.push(
+                i,
+                node,
+                &X11_NESTED_NO_WM,
+                "the nested X server has no window manager: X windows are undecorated and \
+                 unmanaged inside one compositor window"
+                    .to_owned(),
+                "`wm=\"twm\"` runs a window manager inside the sandbox; \
+                 `fullscreen=#true grab=#true` for games; `x11 \"host\"` where an \
+                 application needs the session's window manager",
+            ),
+            "tty" if arg(node) == Some("passthrough") => f.push(
+                i,
+                node,
+                &TTY_PASSTHROUGH,
+                "`tty \"passthrough\"` hands the sandbox this terminal's own descriptors"
+                    .to_owned(),
+                "leave the default `pty` unless the command has to share the caller's terminal",
+            ),
+            "etc" if arg(node) == Some("host") => f.push(
+                i,
+                node,
+                &ETC_HOST,
+                "`etc \"host\"` binds the host's whole `/etc` read-only in place of the \
+                 allowlist: `hostname` (on a machine named after its user, the username \
+                 again), `fstab`, `ssh_config` and every other \
+                 world-readable file the host keeps there becomes visible; `passwd`/`group` \
+                 stay the synthetic ones bubbler writes, overlaid with the shadow-suite \
+                 backups and empty `subuid`/`subgid` where the host has them, so the host \
+                 username stays hidden"
+                    .to_owned(),
+                "drop the argument for the tmpfs allowlist, or accept it with \
+                 `lint-allow \"etc-host\" reason=\"...\"` naming what the application reads \
+                 from `/etc` that the allowlist misses",
+            ),
+            "network" if arg(node) == Some("host") => f.push(
+                i,
+                node,
+                &NETWORK_HOST,
+                "`network \"host\"` shares the host network namespace: every host \
+                 loopback service and every abstract unix socket (X11's included) \
+                 is reachable"
+                    .to_owned(),
+                "drop the argument for the sandbox's own network namespace, or accept it \
+                 with `lint-allow \"network-host\" reason=\"...\"` naming the host \
+                 service the application needs",
+            ),
+            "wayland" if arg(node) == Some("host") => f.push(
+                i,
+                node,
+                &WAYLAND_HOST,
+                "`wayland \"host\"` hands over the session socket: the compositor cannot tell \
+                 this sandbox from your session, so screen capture, reading the clipboard \
+                 without focus and input injection stay open to it"
+                    .to_owned(),
+                "drop the argument for a security-context socket, or accept it with \
+                 `lint-allow \"wayland-host\" reason=\"...\"` naming the privileged protocol \
+                 the application needs; no clipboard proxy runs in front of the session \
+                 socket either, so a focused read is not gated with it",
+            ),
+            "network" => network_node(i, node, f),
+            "seccomp" if kids(node).any(|c| c.name().value() == "disable") => f.push(
+                i,
+                node,
+                &SECCOMP_DISABLED,
+                "`seccomp { disable }` leaves the sandbox with no syscall filter at all".to_owned(),
+                "allow the syscalls the app needs instead, or accept it with \
+                 `lint-allow \"seccomp-disabled\" reason=\"...\"`",
+            ),
+            "env" => env_node(i, node, f),
+            "home-share" => home_share(ctx, i, node, f),
+            "path-share" => path_share(ctx, i, node, f),
+            "etc-share" => {
+                if let Some(name) = arg(node) {
+                    share_source(
+                        ctx,
+                        i,
+                        node,
+                        "etc-share",
+                        name,
+                        &Path::new("/etc").join(name),
+                        f,
+                    );
+                }
+            }
+            "dri" if flag(node, "kms") == Some(true) => f.push(
+                i,
+                node,
+                &DRI_KMS,
+                "`dri kms=#true` binds the primary nodes and leaves their sysfs readable: \
+                 the sandbox reads the monitors' EDID serial numbers, the framebuffer \
+                 geometry and every other client's flink names, and becomes DRM master \
+                 on a virtual terminal switch"
+                    .to_owned(),
+                "drop the property unless the application sets a display mode itself; \
+                 rendering, video decoding and Vulkan need only the render nodes the bare \
+                 node binds",
+            ),
+            "dri" if service::dri_binds_a_primary_node(ctx.host) => f.push(
+                i,
+                node,
+                &DRI_NVIDIA_PRIMARY,
+                "a GPU on this host is on the proprietary NVIDIA driver, whose EGL will \
+                 not drive a Wayland display without the primary node, so `dri` binds \
+                 that node: through it the sandbox reads the connectors, their modes, \
+                 the monitors' EDID"
+                    .to_owned(),
+                "nothing narrower exists on that driver; run the application on a GPU \
+                 the Mesa drivers drive, or accept it with \
+                 `lint-allow \"dri-nvidia-primary\" reason=\"...\"`",
+            ),
+            "camera" if flag(node, "nodes") == Some(true) => {
+                camera_nodes(ctx, i, node, host_net, f);
+            }
+            "portals" if kids(node).any(|c| c.name().value() == "secrets") => f.push(
+                i,
+                node,
+                &SECRETS_ACCESS,
+                "`portals { secrets }` opens org.freedesktop.portal.Secret: the host \
+                 keyring hands the sandbox the secret it stores for this application"
+                    .to_owned(),
+                "drop the child unless the application keeps a secret through the portal, \
+                 or accept it with `lint-allow \"secrets-access\" reason=\"...\"`",
+            ),
+            "pipewire" => {
+                microphone_note(i, node, "pipewire", f);
+                devices_note(i, node, f);
+            }
+            "pulseaudio" => microphone_note(i, node, "pulseaudio", f),
+            "dbus" => dbus_node(i, node, f),
+            "system-bus" => system_bus(i, node, f),
+            "app-runtime" if prop(node, "mode") == Some("rw") => f.push(
+                i,
+                node,
+                &APP_RUNTIME_RW,
+                format!(
+                    "`app-runtime \"{}\" mode=rw` lets the sandbox replace the sockets \
+                     everything else sharing that id connects to",
+                    arg(node).unwrap_or_default()
+                ),
+                "leave the default `ro` unless this sandbox is the one serving the socket; \
+                 `ro` still allows connect()",
+            ),
+            "mpris" if prop(node, "name").is_some_and(|n| n == "*") => f.push(
+                i,
+                node,
+                &MPRIS_WILDCARD,
+                "`mpris name=\"*\"` owns every media player name on the bus".to_owned(),
+                "name the player, e.g. `mpris name=\"firefox\"`",
+            ),
+            _ => {}
+        }
+    }
+}
+
+// Read from the layer's own document rather than from its expanded nodes: this is the one check
+// that is about how the file is written, so a block must not look like the lines it stands for.
+fn repeat_outside_block(i: usize, source: &Source, f: &mut Findings) {
+    for kind in config::REPEATABLE {
+        let written: Vec<&KdlNode> = source
+            .doc
+            .nodes()
+            .iter()
+            .filter(|n| n.name().value() == *kind && n.children().is_none())
+            .collect();
+        if written.len() < 2 {
+            continue;
+        }
+        // A node the config parser will refuse anyway has no block form to offer; skip this `kind`
+        // rather than every `kind` after it — `collect` into an `Option` stops at the first `None`
+        // without reaching past this one.
+        let Some(mut parts) = written
+            .iter()
+            .copied()
+            .take(3)
+            .map(as_block_child)
+            .collect::<Option<Vec<String>>>()
+        else {
+            continue;
+        };
+        if written.len() > 3 {
+            parts.push("…".to_owned());
+        }
+        f.push(
+            i,
+            written[0],
+            &REPEAT_OUTSIDE_BLOCK,
+            format!("`{kind}` is written {} times, one node each", written.len()),
+            &format!(
+                "write them as one block: `{kind} {{ {} }}`",
+                parts.join("; ")
+            ),
+        );
+    }
+}
+
+// `None` for a node whose shape the config parser refuses, which has no block form to offer.
+// A value prints through `KdlValue`'s own `Display`, which quotes only where a bare identifier
+// would not round-trip and leaves the rest bare.
+fn as_block_child(node: &KdlNode) -> Option<String> {
+    if node.name().value() == "env" {
+        let entry = node.entries().first()?;
+        entry.value().as_string()?;
+        return Some(format!("{} {}", entry.name()?.value(), entry.value()));
+    }
+    let mut entries = node.entries().iter();
+    let first = entries.next()?;
+    if first.name().is_some() {
+        return None;
+    }
+    first.value().as_string()?;
+    let mut out = first.value().to_string();
+    for e in entries {
+        e.value().as_string()?;
+        out.push(' ');
+        out.push_str(e.name()?.value());
+        out.push('=');
+        out.push_str(&e.value().to_string());
+    }
+    Some(out)
+}
+
+fn env_node(i: usize, node: &KdlNode, f: &mut Findings) {
+    for e in node.entries() {
+        let Some(key) = e.name().map(|n| n.value()) else {
+            continue;
+        };
+        if key == "ELECTRON_OZONE_PLATFORM_HINT" {
+            f.push(
+                i,
+                node,
+                &OZONE_HINT_UNNECESSARY,
+                "`env ELECTRON_OZONE_PLATFORM_HINT` was measured to change nothing here: \
+                 an Electron app picks Wayland up from the socket alone"
+                    .to_owned(),
+                "drop the variable",
+            );
+        }
+        let value = e.value().as_string().unwrap_or_default();
+        if !looks_secret(key, value) {
+            continue;
+        }
+        f.push(
+            i,
+            node,
+            &ENV_LOOKS_SECRET,
+            format!("`env {key}` looks like a credential, and a profile is a file people share"),
+            "keep secrets out of the config; the sandbox is not a secret store",
+        );
+    }
+}
+
+// Matched by hand rather than with a pattern crate, which is a dependency this would be the only
+// user of.
+fn looks_secret(key: &str, value: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    let segments: Vec<&str> = upper.split('_').collect();
+    segments.iter().any(|s| SECRET_SEGMENTS.contains(s))
+        || segments
+            .windows(2)
+            .any(|w| SECRET_PAIRS.contains(&[w[0], w[1]]))
+        || SECRET_VALUES.iter().any(|p| value.starts_with(p))
+}
+
+fn home_share(ctx: &Context, i: usize, node: &KdlNode, f: &mut Findings) {
+    let Some(path) = arg(node) else {
+        return;
+    };
+    if let Some(reason) = service::reserved_in_home_reason(ctx.host, ctx.env, Path::new(path)) {
+        f.push(
+            i,
+            node,
+            &HOME_SHARE_RESERVED,
+            reason,
+            "name a directory of your own; the launcher refuses this one, which is \
+             bubbler's own state and what every instance is built out of",
+        );
+    }
+    let sensitive = SENSITIVE_TREE
+        .iter()
+        .find(|s| Path::new(path).starts_with(s))
+        .or_else(|| {
+            SENSITIVE_ROOT
+                .iter()
+                .find(|s| Path::new(**s) == Path::new(path))
+        });
+    if let Some(root) = sensitive {
+        let what = match Path::new(root) == Path::new(path) {
+            true => "shares a directory the private home exists to keep out".to_owned(),
+            false => format!("is under `{root}`, which the private home exists to keep out"),
+        };
+        f.push(
+            i,
+            node,
+            &HOME_SHARE_SENSITIVE,
+            format!("`home-share \"{path}\"` {what}"),
+            "share the directory the app works in, not the one holding your keys, \
+             sessions or other applications' configuration",
+        );
+    }
+    share_source(
+        ctx,
+        i,
+        node,
+        "home-share",
+        path,
+        &ctx.env.home.join(path),
+        f,
+    );
+}
+
+fn path_share(ctx: &Context, i: usize, node: &KdlNode, f: &mut Findings) {
+    let Some(written) = arg(node) else {
+        return;
+    };
+    let path = Path::new(written);
+    if let Some(reason) = service::reserved_reason(ctx.host, ctx.env, path) {
+        f.push(
+            i,
+            node,
+            &PATH_SHARE_RESERVED,
+            reason,
+            "name a directory outside the sandbox's own layout; the launcher refuses this one",
+        );
+    }
+    // Before the type check below, which would otherwise report a socket source as a share of the
+    // wrong type and say nothing about what a shared socket is.
+    let source = ctx.host.canonicalize(path).unwrap_or_else(|| path.into());
+    let named_socket = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|n| n.ends_with(".sock") || n.ends_with(".socket"));
+    let is_socket = ctx.host.file_type(&source).is_some_and(|t| t.is_socket());
+    if named_socket || is_socket {
+        let how = if is_socket { "is" } else { "is named like" };
+        f.push(
+            i,
+            node,
+            &PATH_SHARE_SOCKET,
+            format!(
+                "`path-share \"{written}\"` {how} a socket, and a socket is a command \
+                 channel out of the sandbox"
+            ),
+            "share the files the app reads, not a control socket",
+        );
+        return;
+    }
+    if !share_source(ctx, i, node, "path-share", written, &source, f) {
+        return;
+    }
+    if prop(node, "mode") == Some("rw") && ctx.host.is_mountpoint(&source) == Some(true) {
+        f.push(
+            i,
+            node,
+            &PATH_SHARE_MOUNTPOINT,
+            format!("`path-share \"{written}\" mode=rw` shares a whole mounted filesystem"),
+            "name the directory the app writes in, or share it `mode=ro`",
+        );
+    }
+    let socket = ctx.host.list_dir(&source).into_iter().find(|name| {
+        ctx.host
+            .file_type(&source.join(name))
+            .is_some_and(|t| t.is_socket())
+    });
+    if let Some(name) = socket {
+        f.push(
+            i,
+            node,
+            &PATH_SHARE_SOCKET,
+            format!(
+                "`path-share \"{written}\"` holds the socket `{}`, and a socket is a \
+                 command channel out of the sandbox",
+                name.to_string_lossy()
+            ),
+            "share the files the app reads, not the directory a control socket is in",
+        );
+    }
+}
+
+// `path-share` is the only one the launcher holds to a directory or a regular file, but a
+// `home-share` or `etc-share` of a fifo or a device node is a bind nobody means to write, so the
+// lint holds all three to it.
+fn share_source(
+    ctx: &Context,
+    i: usize,
+    node: &KdlNode,
+    what: &str,
+    written: &str,
+    source: &Path,
+    f: &mut Findings,
+) -> bool {
+    let Some(ty) = ctx.host.file_type(source) else {
+        // An optional share with an absent source is a silent no-op at launch, so nothing to warn
+        // about. `etc-share` has no `optional` property, so `flag` reads it as unset there.
+        if flag(node, "optional") == Some(true) {
+            return false;
+        }
+        f.push(
+            i,
+            node,
+            &SHARE_SOURCE_MISSING,
+            format!(
+                "`{what} \"{written}\"` names {}, which is not on this host",
+                source.display()
+            ),
+            "create it, mark the node `optional=#true`, or drop it; without \
+             `optional` a missing source fails the run rather than skipping the bind",
+        );
+        return false;
+    };
+    if ty.is_dir() || ty.is_file() {
+        return true;
+    }
+    f.push(
+        i,
+        node,
+        &SHARE_SOURCE_MISSING,
+        format!(
+            "`{what} \"{written}\"` names {}, which is {}, not a directory or a regular file",
+            source.display(),
+            kind(ty)
+        ),
+        "name a directory or a regular file; nothing else is a share the sandbox can use",
+    );
+    false
+}
+
+fn kind(ty: std::fs::FileType) -> &'static str {
+    if ty.is_socket() {
+        "a socket"
+    } else if ty.is_fifo() {
+        "a named pipe"
+    } else if ty.is_char_device() {
+        "a character device"
+    } else if ty.is_block_device() {
+        "a block device"
+    } else {
+        "neither"
+    }
+}
+
+fn dbus_node(i: usize, node: &KdlNode, f: &mut Findings) {
+    for rule in kids(node) {
+        let level = rule.name().value();
+        if level == "own" {
+            own_too_wide(i, rule, f);
+        }
+        if !matches!(level, "talk" | "own") {
+            continue;
+        }
+        let Some(name) = rule_name(rule).filter(|n| name_covers(n, SECRETS_NAME)) else {
+            continue;
+        };
+        f.push(
+            i,
+            rule,
+            &SECRETS_ACCESS,
+            format!(
+                "`{level} \"{name}\"` reaches the whole login keyring: the Secret \
+                 Service API partitions nothing between the applications that call it"
+            ),
+            "keep the app's secrets in the private home, or accept it with \
+             `lint-allow \"secrets-access\" reason=\"...\"`",
+        );
+    }
+}
+
+fn own_too_wide(i: usize, rule: &KdlNode, f: &mut Findings) {
+    let Some(name) = arg(rule) else {
+        return;
+    };
+    let Some(prefix) = name.strip_suffix('*') else {
+        return;
+    };
+    if prefix.split('.').filter(|e| !e.is_empty()).count() >= 3 {
+        return;
+    }
+    f.push(
+        i,
+        rule,
+        &OWN_TOO_WIDE,
+        format!("`own \"{name}\"` claims every well-known name under `{prefix}`"),
+        "name the application itself, e.g. `own \"org.example.App.*\"`",
+    );
+}
+
+fn system_bus(i: usize, node: &KdlNode, f: &mut Findings) {
+    for rule in kids(node) {
+        let Some(name) = rule_name(rule) else {
+            continue;
+        };
+        match rule.name().value() {
+            "own" => f.push(
+                i,
+                rule,
+                &OWN_ON_SYSTEM_BUS,
+                format!(
+                    "`own \"{name}\"` on the system bus: the bus sees the proxy's \
+                     credentials, so the name would be owned as you"
+                ),
+                "own names on the session bus; the system bus takes `see`, `talk` and `call`",
+            ),
+            "talk" => {
+                if !POLKIT_NAMES.iter().any(|p| name_covers(name, p)) {
+                    continue;
+                }
+                f.push(
+                    i,
+                    rule,
+                    &SYSTEM_BUS_POLKIT_NAME,
+                    format!(
+                        "`talk \"{name}\"` reaches every method of a service whose \
+                         privileged actions polkit judges as you"
+                    ),
+                    "narrow it to what the app needs, e.g. \
+                     `call \"<name>=<interface>.<method>@<path>\"`",
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+// Checks that need the whole set of layers: a grant one layer relies on
+// may be written in another.
+fn across_layers(ctx: &Context, sources: &[Source], f: &mut Findings) {
+    let anywhere = |name: &str| sources.iter().any(|s| !top(s, name).is_empty());
+    let has_dbus = anywhere("dbus");
+    let has_portals = anywhere("portals");
+    let has_bundle = BUNDLES.iter().any(|b| anywhere(b));
+
+    if !has_dbus {
+        for (i, source) in sources.iter().enumerate() {
+            for node in &source.flat {
+                let name = node.name().value();
+                if !BUNDLES.contains(&name) {
+                    continue;
+                }
+                f.push(
+                    i,
+                    node,
+                    &BUNDLE_WITHOUT_DBUS,
+                    format!(
+                        "`{name}` is carried by the D-Bus proxy and no layer grants `dbus` to start it"
+                    ),
+                    "add a `dbus` node, or drop this one",
+                );
+            }
+        }
+    }
+
+    if has_dbus && !has_bundle {
+        let empty = sources
+            .iter()
+            .flat_map(|s| top(s, "dbus"))
+            .all(|n| kids(n).next().is_none());
+        let first = sources
+            .iter()
+            .enumerate()
+            .find_map(|(i, s)| top(s, "dbus").first().map(|n| (i, *n)));
+        if let Some((i, node)) = first.filter(|_| empty) {
+            f.push(
+                i,
+                node,
+                &DBUS_WITHOUT_RULES,
+                "`dbus` names nothing and no layer adds a bundle, so the proxy it starts \
+                 answers nothing"
+                    .to_owned(),
+                "add `see`, `talk` or `own` rules or a bundle such as `portals`, \
+                 or drop the node",
+            );
+        }
+    }
+
+    if !has_portals {
+        for (i, source) in sources.iter().enumerate() {
+            for node in top(source, "camera") {
+                f.push(
+                    i,
+                    node,
+                    &CAMERA_WITHOUT_PORTALS,
+                    "`camera` is a portal grant and no layer grants `portals`, so the \
+                     sandbox has no `/.flatpak-info` and the portal reads it as an \
+                     ordinary process of yours"
+                        .to_owned(),
+                    "add `portals` (and the `dbus` that carries it), or drop this node",
+                );
+            }
+            for (bus, rule) in bus_rules(source) {
+                let Some(name) = rule_name(rule).filter(|n| name_covers(n, PORTAL_NAMES)) else {
+                    continue;
+                };
+                let help = match bus == "dbus" && undoes_portals(rule) {
+                    true => {
+                        "replace the rule with `portals` (the two together are refused, since \
+                         the rule would undo the `portals` split), or keep the rule knowingly, \
+                         without `portals`"
+                    }
+                    false => "add `portals`, or drop the rule",
+                };
+                f.push(
+                    i,
+                    rule,
+                    &PORTAL_TALK_WITHOUT_PORTALS,
+                    format!(
+                        "`{name}` reaches the portal names, and without `portals` the sandbox has no \
+                         `/.flatpak-info`, so every portal call is refused"
+                    ),
+                    help,
+                );
+            }
+        }
+    }
+
+    // Keyed by bus as well as name: the two proxies are separate, so one name may hold a different
+    // policy on each. Exact names only, as the parser compares them.
+    let mut policies: Vec<(&str, String, &str, usize)> = Vec::new();
+    for (i, source) in sources.iter().enumerate() {
+        for (bus, rule) in bus_rules(source) {
+            let level = match rule.name().value() {
+                level @ ("see" | "talk" | "own") => level,
+                _ => continue,
+            };
+            let Some(name) = rule_name(rule) else {
+                continue;
+            };
+            match policies
+                .iter()
+                .find(|(b, n, _, _)| *b == bus && n == name)
+                .filter(|(_, _, was, _)| *was != level)
+            {
+                Some((_, _, was, whence)) => {
+                    // Naming the layer only says something when it is
+                    // another one; both rules in one file are read there.
+                    let both = match *whence == i {
+                        true => format!("as `{was}` and as `{level}` twice in this file"),
+                        false => format!(
+                            "as `{was}` in {} and as `{level}` here",
+                            sources[*whence].at.label().to_string_lossy()
+                        ),
+                    };
+                    f.push(
+                        i,
+                        rule,
+                        &DUP_NAME_POLICY,
+                        format!("`{name}` is granted {both}; one name takes one policy"),
+                        "keep the narrower of the two",
+                    );
+                }
+                None => policies.push((bus, name.to_owned(), level, i)),
+            }
+        }
+    }
+
+    // The last layer that names the mode is the one the merge keeps, so a bare `wayland` written
+    // over `clipboard="open"` leaves the gate on and nothing to report.
+    if let Some((i, node)) = last(sources, "wayland")
+        && prop(node, "clipboard") == Some("open")
+    {
+        f.push(
+            i,
+            node,
+            &WAYLAND_CLIPBOARD_OPEN,
+            "`clipboard=\"open\"` turns the paste gate off: the sandbox may read the \
+             selection and the primary selection whenever it holds keyboard focus, with \
+             no keystroke of yours behind the read, and the proxy only logs it"
+                .to_owned(),
+            "drop the property so a read is forwarded only just after a key, button or \
+             touch of yours — the gate is what stops an application polling the \
+             clipboard in the background for whatever you copy next — or accept it with \
+             `lint-allow \"wayland-clipboard-open\" reason=\"...\"` naming what reads \
+             the clipboard unattended",
+        );
+    }
+
+    let command = last(sources, "command").and_then(|(i, n)| arg(n).map(|a| (i, n, a)));
+    if let Some((i, node, disable)) =
+        last(sources, "userns").map(|(i, n)| (i, n, arg(n) == Some("disable")))
+        && disable
+        && let Some((_, _, argv0)) = command
+        && is_nester(argv0)
+    {
+        f.push(
+            i,
+            node,
+            &USERNS_DISABLED_WITH_NESTED_SANDBOX,
+            format!(
+                "`userns \"disable\"` with `command \"{argv0}\"`, which is known to start a \
+                 sandbox of its own inside this one, and the new mount API a nested sandbox \
+                 needs is denied as well; the list of such commands is a heuristic"
+            ),
+            "drop `userns \"disable\"` if the app does not start; `--explain=full` lists \
+             the calls the filter denies",
+        );
+    }
+    if let Some((i, node, argv0)) = command
+        && !on_path(ctx, sources, argv0)
+    {
+        f.push(
+            i,
+            node,
+            &COMMAND_NOT_FOUND,
+            format!("`{argv0}` is not on this host's PATH"),
+            "a profile may be written for software you have not installed; \
+             otherwise fix the `command` node",
+        );
+    }
+    if let Some((i, node, name)) =
+        last(sources, "desktop").and_then(|(i, n)| arg(n).map(|a| (i, n, a)))
+        && !entry_exists(ctx, name)
+    {
+        f.push(
+            i,
+            node,
+            &DESKTOP_ENTRY_MISSING,
+            format!("no `{name}` in this host's application directories"),
+            "`bubbler desktop` has nothing to copy until the application is \
+             installed; otherwise fix the `desktop` node",
+        );
+    }
+
+    // Two nodes, and not always in one layer: one hands over the
+    // terminal, the other takes away the filter that guards it.
+    // `|&(_, n)|` and `into_iter()`, both to hand `arg` and `kids` a
+    // `&KdlNode` rather than the `&&KdlNode` a borrowed pattern binds.
+    let passthrough = last(sources, "tty").filter(|&(_, n)| arg(n) == Some("passthrough"));
+    let disabled = sources.iter().any(|s| {
+        top(s, "seccomp")
+            .into_iter()
+            .any(|n| kids(n).any(|c| c.name().value() == "disable"))
+    });
+    if let Some((i, node)) = passthrough.filter(|_| disabled) {
+        f.push(
+            i,
+            node,
+            &TTY_PASSTHROUGH_WITHOUT_SECCOMP,
+            "`tty \"passthrough\"` hands the sandbox this terminal's own descriptors and \
+             `seccomp { disable }` takes away the `TIOCSTI` and `TIOCLINUX` rules that \
+             stop it typing into them"
+                .to_owned(),
+            "leave the default `pty`, or keep the filter and take off the names the \
+             application needs one at a time with `seccomp { allow \"...\" }`",
+        );
+    }
+}
+
+// Probed rather than read: only its existence decides this.
+fn entry_exists(ctx: &Context, name: &str) -> bool {
+    desktop::Dirs::from_env(ctx.env)
+        .lookup()
+        .any(|dir| ctx.host.file_type(&dir.join(name)).is_some())
+}
+
+fn is_nester(argv0: &str) -> bool {
+    let base = Path::new(argv0)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or(argv0);
+    base.starts_with("electron") || NESTERS.contains(&base)
+}
+
+// A command written for the sandbox's own home is looked up under this host's `$HOME`, but only
+// where a `home-share` binds that path in.
+fn on_path(ctx: &Context, sources: &[Source], argv0: &str) -> bool {
+    let path = Path::new(argv0);
+    if path.components().count() > 1 {
+        let host_path = match path.strip_prefix(SANDBOX_HOME) {
+            Ok(rest) if home_share_covers(sources, rest) => ctx.env.home.join(rest),
+            Ok(_) => return false,
+            Err(_) => path.to_path_buf(),
+        };
+        return ctx.host.file_type(&host_path).is_some();
+    }
+    ctx.search_path
+        .iter()
+        .any(|dir| ctx.host.file_type(&dir.join(argv0)).is_some())
+}
+
+fn home_share_covers(sources: &[Source], rel: &Path) -> bool {
+    sources
+        .iter()
+        .flat_map(|s| top(s, "home-share"))
+        .filter_map(arg)
+        .any(|share| rel.starts_with(share))
+}
+
+/// Lint every profile name any layer holds, as `--all` does.
+pub fn lint_all(ctx: &Context, resolver: &Resolver) -> Result<Report, LintError> {
+    let mut out = Report::default();
+    for entry in resolver.list()? {
+        out.absorb(lint_profile(ctx, resolver, &entry.name)?);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "tests write temp files")]
+mod tests {
+    use super::*;
+    use crate::config::Service;
+    use crate::host::fake::{self, FakeHost};
+    use crate::profile;
+
+    /// A host environment with a fixed home, so a `home-share` source is
+    /// the same path in every test.
+    fn env() -> Env {
+        Env {
+            home: PathBuf::from("/home/user"),
+            data_home: PathBuf::from("/home/user/.local/share"),
+            config_home: PathBuf::from("/home/user/.config"),
+            config_dirs: crate::env::DEFAULT_CONFIG_DIRS
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+            data_dirs: crate::env::DEFAULT_DATA_DIRS
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+            runtime_dir: PathBuf::from("/run/user/1000"),
+            uid: 1000,
+            gid: 1000,
+            wayland_display: None,
+            display: None,
+            xauthority: None,
+            passthrough: vec![],
+            init_override: None,
+            dbus_address: None,
+            dbus_system_address: None,
+            at_spi_bus_address: None,
+            dbus_log: false,
+            net_proxy_log: false,
+            seccomp_log: false,
+            test_allow_path: None,
+            profile_dir_override: None,
+            proxy_override: None,
+            pasta_override: None,
+            pw_dump_override: None,
+            wl_proxy_override: None,
+            net_proxy_override: None,
+        }
+    }
+
+    /// Run `f` with a context over `host`, `/home/user` and a `$PATH` of
+    /// `/usr/bin`.
+    fn with<T>(host: &dyn Host, f: impl FnOnce(&Context) -> T) -> T {
+        let e = env();
+        let path = [PathBuf::from("/usr/bin")];
+        let current = |_: &Env| LoadedRevision::Current;
+        f(&Context {
+            env: &e,
+            host,
+            search_path: &path,
+            loaded_revision: &current,
+            app_id_twin: None,
+        })
+    }
+
+    /// Lint several layers, in merge order, as files `/p/<i>.kdl`.
+    fn lint(ctx: &Context, layers: &[&str]) -> Report {
+        let sources: Vec<Source> = layers
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                Source::read(
+                    Where::File(PathBuf::from(format!("/p/{i}.kdl"))),
+                    (*text).to_owned(),
+                )
+                .expect("test layers are valid KDL")
+            })
+            .collect();
+        run(ctx, &sources)
+    }
+
+    /// The ids a run reported, in order.
+    fn ids(report: &Report) -> Vec<&str> {
+        report.findings.iter().map(|f| f.id).collect()
+    }
+
+    /// A host holding only `/usr/bin/foot`, which the `command` node of
+    /// most of these fixtures names.
+    fn host() -> FakeHost {
+        let (file, _, _) = fake::types();
+        FakeHost::default().with("/usr/bin/foot", file)
+    }
+
+    /// The hook where the fake environment's `$XDG_DATA_HOME` puts it.
+    const HOOK_PATH: &str = "/home/user/.local/share/wireplumber/scripts/bubbler/refuse-links.lua";
+
+    /// The filter is a note, not a warning: it is what the config asked
+    /// for, and what it says is what address filtering cannot do.
+    #[test]
+    fn outbound_deny_is_a_note_naming_what_an_address_policy_misses() {
+        with(&host(), |ctx| {
+            let report = lint(
+                ctx,
+                &["network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\" port=443\n}"],
+            );
+            assert_eq!(ids(&report), ["outbound-deny"]);
+            assert_eq!(report.findings[0].severity, Severity::Note);
+            assert!(
+                report.findings[0].help.contains("address policy"),
+                "{report:?}"
+            );
+            for clean in ["network", "network {\n    outbound \"allow\"\n}"] {
+                assert_eq!(ids(&lint(ctx, &[clean])), [] as [&str; 0], "{clean}");
+            }
+        });
+    }
+
+    /// The note is about what the filter leaves open, and an
+    /// `allow-host` changes that: the resolver rules gain the proxy's
+    /// cgroup match, so the sandbox that used to reach its resolver no
+    /// longer does. A reader of the other message would take the
+    /// opposite of their own config from it.
+    #[test]
+    fn the_outbound_deny_note_says_what_an_allow_host_leaves_open() {
+        with(&host(), |ctx| {
+            let by_address = lint(
+                ctx,
+                &["network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\"\n}"],
+            );
+            assert_eq!(ids(&by_address), ["outbound-deny"]);
+            assert!(
+                by_address.findings[0]
+                    .message
+                    .contains("reaches its resolver"),
+                "{by_address:?}"
+            );
+
+            let by_name = lint(
+                ctx,
+                &[
+                    "network {\n    outbound \"deny\"\n    allow-out \"1.1.1.1\"\n    \
+                     allow-host \"api.example.com\"\n}",
+                ],
+            );
+            assert_eq!(ids(&by_name), ["outbound-deny"]);
+            let finding = &by_name.findings[0];
+            assert_eq!(finding.severity, Severity::Note);
+            // The one thing the other message promises and this
+            // configuration does not give.
+            assert!(
+                !finding.message.contains("reaches its resolver"),
+                "{finding:?}"
+            );
+            assert!(
+                finding.message.contains("resolves nothing itself"),
+                "{finding:?}"
+            );
+            assert!(
+                finding.message.contains("through bubbler's proxy"),
+                "{finding:?}"
+            );
+            assert!(
+                finding.help.contains("ignores `HTTPS_PROXY`"),
+                "{finding:?}"
+            );
+        });
+    }
+
+    /// A wildcard directly under a top-level domain covers every name
+    /// anyone can register there, which is worth saying and is not a
+    /// mistake: a wildcard under a name of the author's own is not.
+    #[test]
+    fn a_wildcard_allow_host_under_a_top_level_domain_is_a_note() {
+        with(&host(), |ctx| {
+            let report = lint(
+                ctx,
+                &["network {\n    outbound \"deny\"\n    allow-host \"*.com\"\n}"],
+            );
+            assert_eq!(ids(&report), ["outbound-deny", "allow-host-wildcard"]);
+            assert_eq!(report.findings[1].severity, Severity::Note);
+            assert!(report.findings[1].message.contains("*.com"), "{report:?}");
+            let narrow = lint(
+                ctx,
+                &[
+                    "network {\n    outbound \"deny\"\n    allow-host \"*.example.com\"\n    \
+                   allow-host \"api.example.com\"\n}",
+                ],
+            );
+            assert_eq!(ids(&narrow), ["outbound-deny"]);
+        });
+    }
+
+    /// The host's whole `/etc` is a warning of the same weight as
+    /// `wayland "host"` and `network "host"`: the username stays hidden,
+    /// but everything else the host keeps in `/etc` becomes visible.
+    #[test]
+    fn etc_host_is_a_warning_and_the_bare_node_is_not() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["etc \"host\""]);
+            assert_eq!(ids(&report), ["etc-host"]);
+            assert_eq!(report.findings[0].severity, Severity::Warning);
+            assert_eq!(ids(&lint(ctx, &["etc"])), [] as [&str; 0]);
+            let allowed = lint(
+                ctx,
+                &["etc \"host\"\nlint-allow \"etc-host\" reason=\"needs /etc/fstab\""],
+            );
+            assert_eq!(ids(&allowed), [] as [&str; 0]);
+        });
+    }
+
+    /// The session's socket is a warning of the same weight as
+    /// `network "host"`: what the argument gives up is the compositor's
+    /// own enforcement, and nothing else in the sandbox stands in for it.
+    #[test]
+    fn wayland_host_is_a_warning_and_the_bare_node_is_not() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["wayland \"host\""]);
+            assert_eq!(ids(&report), ["wayland-host"]);
+            assert_eq!(report.findings[0].severity, Severity::Warning);
+            assert_eq!(ids(&lint(ctx, &["wayland"])), [] as [&str; 0]);
+            let allowed = lint(
+                ctx,
+                &["wayland \"host\"\nlint-allow \"wayland-host\" \
+                   reason=\"needs zwlr_layer_shell_v1\""],
+            );
+            assert_eq!(ids(&allowed), [] as [&str; 0]);
+            // The proxy is part of what the argument gives up, and the
+            // help is where a reader is told so.
+            assert!(
+                report.findings[0].help.contains("clipboard proxy"),
+                "{report:?}"
+            );
+        });
+    }
+
+    /// The property is a warning of its own, and the help says what the
+    /// gate it turns off was for: a reader who is told only that the
+    /// clipboard is open has no way to weigh it. Read off the node the
+    /// merge keeps, so a layer that writes the bare node over a
+    /// profile's `clipboard="open"` is not warned about a gate it turned
+    /// back on.
+    #[test]
+    fn wayland_clipboard_open_is_a_warning_the_bare_node_does_not_raise() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["wayland clipboard=\"open\""]);
+            assert_eq!(ids(&report), ["wayland-clipboard-open"]);
+            assert_eq!(report.findings[0].severity, Severity::Warning);
+            assert!(
+                report.findings[0].help.contains("in the background"),
+                "{report:?}"
+            );
+            assert_eq!(ids(&lint(ctx, &["wayland"])), [] as [&str; 0]);
+            let allowed = lint(
+                ctx,
+                &[
+                    "wayland clipboard=\"open\"\nlint-allow \"wayland-clipboard-open\" \
+                   reason=\"a clipboard manager of its own\"",
+                ],
+            );
+            assert_eq!(ids(&allowed), [] as [&str; 0]);
+            // The layer above decides the mode, in both directions.
+            assert_eq!(
+                ids(&lint(ctx, &["wayland clipboard=\"open\"", "wayland"])),
+                [] as [&str; 0]
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["wayland", "wayland clipboard=\"open\""])),
+                ["wayland-clipboard-open"]
+            );
+        });
+    }
+
+    /// Only the host namespace is a finding, and it is a warning: what
+    /// the argument reaches is not the LAN alone but every service the
+    /// host runs on its own loopback, and every abstract unix socket,
+    /// which no filesystem permission covers.
+    #[test]
+    fn network_host_is_a_warning_and_the_other_modes_are_not() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["network \"host\""]);
+            assert_eq!(ids(&report), ["network-host"]);
+            assert_eq!(report.findings[0].severity, Severity::Warning);
+            assert!(
+                report.findings[0].message.contains(
+                    "every host loopback service and every abstract unix socket \
+                     (X11's included) is reachable"
+                ),
+                "{}",
+                report.findings[0].message
+            );
+            for clean in [
+                "network",
+                "network \"none\"",
+                "network {\n    dns \"1.1.1.1\"\n}",
+            ] {
+                assert_eq!(ids(&lint(ctx, &[clean])), [] as [&str; 0], "{clean}");
+            }
+            let allowed = lint(
+                ctx,
+                &["network \"host\"\nlint-allow \"network-host\" reason=\"LAN discovery\""],
+            );
+            assert_eq!(ids(&allowed), [] as [&str; 0]);
+        });
+    }
+
+    /// The terminal is handed over by one node and the filter that keeps
+    /// the sandbox from typing into it is taken away by another, in the
+    /// same file or in another layer.
+    #[test]
+    fn passthrough_without_a_filter_is_a_warning_of_its_own() {
+        with(&host(), |ctx| {
+            let both = lint(ctx, &["tty \"passthrough\"\nseccomp {\n    disable\n}"]);
+            assert_eq!(
+                ids(&both),
+                [
+                    "tty-passthrough",
+                    "tty-passthrough-without-seccomp",
+                    "seccomp-disabled"
+                ]
+            );
+            let split = lint(ctx, &["tty \"passthrough\"", "seccomp {\n    disable\n}"]);
+            assert!(
+                split
+                    .findings
+                    .iter()
+                    .any(|f| f.id == "tty-passthrough-without-seccomp")
+            );
+            // Either one on its own says nothing new.
+            for alone in ["tty \"passthrough\"", "seccomp {\n    disable\n}"] {
+                assert!(
+                    !ids(&lint(ctx, &[alone])).contains(&"tty-passthrough-without-seccomp"),
+                    "{alone}"
+                );
+            }
+            // One block, not three lines: three line-form `lint-allow`
+            // nodes would themselves be `repeat-outside-block`.
+            let allowed = lint(
+                ctx,
+                &["tty \"passthrough\"\nseccomp {\n    disable\n}\n\
+                   lint-allow {\n    \"tty-passthrough\" reason=\"a\"\n    \
+                   \"seccomp-disabled\" reason=\"b\"\n    \
+                   \"tty-passthrough-without-seccomp\" reason=\"c\"\n}"],
+            );
+            assert_eq!(ids(&allowed), [] as [&str; 0]);
+        });
+    }
+
+    /// The bare grant is the render nodes, which say nothing about the
+    /// display; the property is what puts the monitors back in reach, so
+    /// it is a note rather than silence.
+    #[test]
+    fn dri_kms_is_a_note_and_the_bare_grant_is_not() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["dri kms=#true"]);
+            assert_eq!(ids(&report), ["dri-kms"]);
+            assert_eq!(report.findings[0].severity, Severity::Note);
+            assert!(report.findings[0].message.contains("EDID"), "{report:?}");
+            for quiet in ["dri", "dri kms=#false"] {
+                assert_eq!(ids(&lint(ctx, &[quiet])), [] as [&str; 0], "{quiet}");
+            }
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &["dri kms=#true\nlint-allow \"dri-kms\" reason=\"a KMS test tool\""]
+                )),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    /// A `microphone` child is what puts capture in reach; the bare node
+    /// says nothing about it and stays quiet. Measured on a host with the
+    /// policy drop-in installed, so it is the one finding under test and
+    /// not `audio-policy-missing`, which is independent of it.
+    #[test]
+    fn pipewire_microphone_is_a_note_and_the_bare_grant_is_not() {
+        let (file, _, _) = fake::types();
+        let quiet = host()
+            .with(
+                "/home/user/.config/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+                file,
+            )
+            .text(
+                "/home/user/.config/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+                audio_policy::DROP_IN,
+            )
+            .with(HOOK_PATH, file)
+            .text(HOOK_PATH, audio_policy::HOOK);
+        with(&quiet, |ctx| {
+            for node in ["pipewire", "pulseaudio"] {
+                let text = format!("{node} {{\n    microphone\n}}");
+                let report = lint(ctx, &[&text]);
+                assert_eq!(ids(&report), ["pipewire-microphone"], "{node}");
+                assert_eq!(report.findings[0].severity, Severity::Note, "{node}");
+                assert!(report.findings[0].message.contains(node), "{node}");
+                assert_eq!(ids(&lint(ctx, &[node])), [] as [&str; 0], "{node}");
+                assert_eq!(
+                    ids(&lint(
+                        ctx,
+                        &[&format!(
+                            "{text}\nlint-allow \"pipewire-microphone\" reason=\"voice chat\""
+                        )]
+                    )),
+                    [] as [&str; 0],
+                    "{node}"
+                );
+            }
+        });
+        // The two `pulseaudio` findings are about different things — the
+        // child and the missing policy install — so a node that raises
+        // both keeps both rather than the second silencing the first.
+        with(&host(), |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["pulseaudio {\n    microphone\n}"])),
+                ["pipewire-microphone", "audio-policy-missing"]
+            );
+        });
+    }
+
+    /// A host whose GPU is on the proprietary NVIDIA driver: the render
+    /// node udev names, the class entry it is found through, and the
+    /// driver link that says which stack drives it.
+    fn gpu_host(driver: &str) -> FakeHost {
+        let (_, dir, _) = fake::types();
+        let device = "/sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0";
+        host()
+            .with("/dev/dri/by-path/pci-0000:01:00.0-render", dir)
+            .link("/dev/dri/by-path/pci-0000:01:00.0-render", "../renderD128")
+            .link("/sys/class/drm/renderD128/device", device)
+            .link(
+                &format!("{device}/driver"),
+                &format!("../../../../bus/pci/drivers/{driver}"),
+            )
+    }
+
+    /// The bare node binds a primary node on that driver, whose EGL will
+    /// not drive a Wayland display without one, and the file says nothing
+    /// about it: the note is where a reader learns what the run opens.
+    #[test]
+    fn dri_on_an_nvidia_host_is_a_note_and_on_a_mesa_host_is_not() {
+        with(&gpu_host("nvidia"), |ctx| {
+            let report = lint(ctx, &["dri"]);
+            assert_eq!(ids(&report), ["dri-nvidia-primary"]);
+            assert_eq!(report.findings[0].severity, Severity::Note);
+            assert!(report.findings[0].message.contains("EDID"), "{report:?}");
+            // `kms=#true` already says it in the file, and says more.
+            assert_eq!(ids(&lint(ctx, &["dri kms=#true"])), ["dri-kms"]);
+        });
+        with(&gpu_host("amdgpu"), |ctx| {
+            assert_eq!(ids(&lint(ctx, &["dri"])), [] as [&str; 0]);
+        });
+    }
+
+    /// The session's socket is the warning; the server the sandbox runs
+    /// for itself gives nothing away and is a note about what it cannot
+    /// do. Both are accepted by a `lint-allow` naming them.
+    #[test]
+    fn x11_host_is_a_warning_and_the_nested_default_is_a_note() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["x11 \"host\""]);
+            assert_eq!(ids(&report), ["x11-without-reason"]);
+            assert_eq!(report.findings[0].severity, Severity::Warning);
+            let nested = lint(ctx, &["x11 geometry=\"1920x1080\""]);
+            assert_eq!(ids(&nested), ["x11-nested-no-wm"]);
+            assert_eq!(nested.findings[0].severity, Severity::Note);
+            // A server that fills the output has no windows to manage,
+            // so there is nothing left to say about it, and a config
+            // that names a window manager has already done something
+            // about it.
+            for quiet in ["x11 fullscreen=#true grab=#true", "x11 wm=\"twm\""] {
+                assert_eq!(ids(&lint(ctx, &[quiet])), [] as [&str; 0], "{quiet}");
+            }
+            // The help names the property that silences it, so a reader
+            // who wants a managed window has the fix in the finding.
+            assert!(
+                nested.findings[0].help.contains("wm=\"twm\""),
+                "{}",
+                nested.findings[0].help
+            );
+            assert_eq!(ids(&lint(ctx, &["wayland"])), [] as [&str; 0]);
+            for text in [
+                "x11 \"host\"\nlint-allow \"x11-without-reason\" reason=\"no Wayland backend\"",
+                "x11\nlint-allow \"x11-nested-no-wm\" reason=\"one fullscreen game\"",
+            ] {
+                assert_eq!(ids(&lint(ctx, &[text])), [] as [&str; 0], "{text}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_camera_grant_is_measured_against_the_portal_and_the_host() {
+        let (file, dir, _) = fake::types();
+        let with_camera = FakeHost::default()
+            .with("/usr/bin/foot", file)
+            .with("/dev", dir)
+            .with("/dev/video0", fake::char_type());
+        with(&with_camera, |ctx| {
+            // The portal is the grant; the device nodes are an extra on
+            // top of it, and neither works without `/.flatpak-info`.
+            assert_eq!(ids(&lint(ctx, &["camera"])), ["camera-without-portals"]);
+            assert_eq!(lint(ctx, &["camera"]).findings[0].severity, Severity::Error);
+            // The `portals` may be written in another layer.
+            assert_eq!(
+                ids(&lint(ctx, &["dbus\nportals", "camera"])),
+                [] as [&str; 0]
+            );
+            // A host with a camera: only the frozen device list is worth
+            // saying, and the bare grant carries neither note.
+            assert_eq!(
+                ids(&lint(ctx, &["dbus\nportals\ncamera nodes=#true"])),
+                ["camera-nodes-no-hotplug"]
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["dbus\nportals\ncamera nodes=#false"])),
+                [] as [&str; 0]
+            );
+            // The device list is frozen whatever the network is, but
+            // only a namespace of its own keeps the uevent from the
+            // sandbox — and the mode may be named in another layer.
+            let isolated = lint(ctx, &["dbus\nportals\ncamera nodes=#true"]);
+            assert!(
+                isolated.findings[0]
+                    .message
+                    .contains("never told about one"),
+                "{isolated:#?}"
+            );
+            for layers in [
+                &["dbus\nportals\ncamera nodes=#true\nnetwork \"host\""][..],
+                &["network \"host\"", "dbus\nportals\ncamera nodes=#true"][..],
+            ] {
+                let report = lint(ctx, layers);
+                let camera = report
+                    .findings
+                    .iter()
+                    .find(|f| f.id == "camera-nodes-no-hotplug")
+                    .expect("the frozen list is reported whatever the network is");
+                assert!(
+                    !camera.message.contains("never told about one"),
+                    "{camera:#?}"
+                );
+            }
+        });
+        with(&host(), |ctx| {
+            // No node on this host, so the device half binds nothing.
+            let report = lint(ctx, &["dbus\nportals\ncamera nodes=#true"]);
+            assert_eq!(
+                ids(&report),
+                ["camera-nodes-none-present", "camera-nodes-no-hotplug"]
+            );
+            assert!(
+                report.findings.iter().all(|f| f.severity == Severity::Note),
+                "{report:#?}"
+            );
+        });
+    }
+
+    /// The `secrets` child is the portal Secret interface, and the note
+    /// that covers `talk "org.freedesktop.secrets"` covers it too.
+    #[test]
+    fn the_secrets_child_carries_the_secrets_note() {
+        with(&host(), |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["dbus\nportals {\n    secrets\n}"])),
+                ["secrets-access"]
+            );
+            assert_eq!(
+                lint(ctx, &["dbus\nportals {\n    secrets\n}"]).findings[0].severity,
+                Severity::Note
+            );
+            // Another child raises nothing.
+            assert_eq!(
+                ids(&lint(ctx, &["dbus\nportals {\n    screencast\n}"])),
+                [] as [&str; 0]
+            );
+            // And it can be accepted like any other note.
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &[
+                        "lint-allow \"secrets-access\" reason=\"the app stores its own token\"\n\
+                       dbus\nportals {\n    secrets\n}"
+                    ]
+                )),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    /// A `camera` written bare still needs `portals`; the child form
+    /// cannot be written without it, so nothing new is checked there.
+    #[test]
+    fn camera_without_portals_survives_the_split() {
+        let (_, dir, _) = fake::types();
+        let host = host().with("/dev", dir);
+        with(&host, |ctx| {
+            assert_eq!(ids(&lint(ctx, &["camera"])), ["camera-without-portals"]);
+            assert_eq!(
+                ids(&lint(ctx, &["dbus\nportals {\n    camera\n}"])),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    /// The child is the same grant as the bare node, so the checks that
+    /// measure `camera nodes=#true` against the host report it in either
+    /// form.
+    #[test]
+    fn the_camera_child_is_linted_like_the_bare_node() {
+        with(&host(), |ctx| {
+            let bare = lint(ctx, &["dbus\nportals\ncamera nodes=#true"]);
+            let child = lint(ctx, &["dbus\nportals {\n    camera nodes=#true\n}"]);
+            assert_eq!(
+                ids(&child),
+                ["camera-nodes-none-present", "camera-nodes-no-hotplug"]
+            );
+            assert_eq!(ids(&bare), ids(&child));
+            assert_eq!(
+                bare.findings.iter().map(|f| &f.message).collect::<Vec<_>>(),
+                child
+                    .findings
+                    .iter()
+                    .map(|f| &f.message)
+                    .collect::<Vec<_>>()
+            );
+            // Each finding points at the child's own line, not at the
+            // `portals` node that opens the block.
+            assert!(
+                child.findings.iter().all(|f| f.line == Some(3)),
+                "{child:#?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_lint_allow_node_reaches_across_layers() {
+        // The accepted finding and the node it is about need not be in
+        // the same file: a user layer may accept what a built-in grants.
+        with(&host(), |ctx| {
+            let report = lint(
+                ctx,
+                &[
+                    "x11 \"host\"",
+                    "lint-allow \"x11-without-reason\" reason=\"measured\"",
+                ],
+            );
+            assert_eq!(ids(&report), [] as [&str; 0]);
+        });
+    }
+
+    #[test]
+    fn a_disabled_seccomp_filter_and_a_passed_through_terminal_are_warnings() {
+        with(&host(), |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["seccomp {\n    disable\n}"])),
+                ["seccomp-disabled"]
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["seccomp {\n    allow \"keyctl\"\n}"])),
+                [] as [&str; 0]
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["tty \"passthrough\""])),
+                ["tty-passthrough"]
+            );
+            assert_eq!(ids(&lint(ctx, &["tty \"none\""])), [] as [&str; 0]);
+        });
+    }
+
+    #[test]
+    fn an_environment_value_shaped_like_a_credential_is_a_warning() {
+        with(&host(), |ctx| {
+            for text in [
+                "env GITHUB_TOKEN=\"x\"",
+                "env api_key=\"x\"",
+                "env MY_APIKEY=\"x\"",
+                "env MY_PAT=\"x\"",
+                "env AWS_SECRET_ACCESS_KEY=\"x\"",
+                "env WHATEVER=\"ghp_abcdef\"",
+                "env KEY=\"AKIAEXAMPLE\"",
+            ] {
+                assert_eq!(ids(&lint(ctx, &[text])), ["env-looks-secret"], "{text}");
+            }
+            // Whole underscore-separated words, not substrings: a name
+            // that merely starts with one of them is not a credential.
+            for text in [
+                "env SAL_USE_VCLPLUGIN=\"gtk3\"",
+                "env TOKENIZERS_PARALLELISM=\"false\"",
+                "env COMPAT_MODE=\"1\"",
+                "env KEYBOARD_LAYOUT=\"us\"",
+            ] {
+                assert_eq!(ids(&lint(ctx, &[text])), [] as [&str; 0], "{text}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_writable_app_runtime_share_is_a_note() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["app-runtime \"org.keepassxc.KeePassXC\" mode=rw"]);
+            assert_eq!(ids(&report), ["app-runtime-rw"]);
+            assert_eq!(report.findings[0].severity, Severity::Note);
+            assert!(
+                report.findings[0]
+                    .message
+                    .contains("org.keepassxc.KeePassXC"),
+                "{report:?}"
+            );
+            // The default is read-only, which cannot take a socket away
+            // from anyone, so it says nothing. Neither does the linter
+            // look for the directory: bubbler creates it at launch.
+            assert_eq!(
+                ids(&lint(ctx, &["app-runtime \"org.keepassxc.KeePassXC\""])),
+                [] as [&str; 0]
+            );
+            // And the note is one a profile may accept.
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &["app-runtime \"org.keepassxc.KeePassXC\" mode=rw\n\
+                         lint-allow \"app-runtime-rw\" reason=\"it serves the socket\""]
+                )),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    #[test]
+    fn the_electron_ozone_hint_is_a_note() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["env ELECTRON_OZONE_PLATFORM_HINT=\"auto\""]);
+            assert_eq!(ids(&report), ["ozone-hint-unnecessary"]);
+            assert_eq!(report.findings[0].severity, Severity::Note);
+            assert_eq!(
+                ids(&lint(ctx, &["env ELECTRON_ENABLE_LOGGING=\"1\""])),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    #[test]
+    fn sharing_a_directory_the_private_home_exists_to_keep_out_is_a_warning() {
+        let (_, dir, _) = fake::types();
+        let host = host()
+            .with("/home/user/.ssh", dir)
+            .with("/home/user/.ssh/keys", dir)
+            .with("/home/user/.local/share", dir)
+            .with("/home/user/.config/app", dir)
+            .with("/home/user/Downloads", dir);
+        with(&host, |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["home-share \".ssh\""])),
+                ["home-share-sensitive"]
+            );
+            // `.local/share` holds the instance store, which the
+            // launcher refuses before it is sensitive.
+            assert_eq!(
+                ids(&lint(ctx, &["home-share \".local/share\""])),
+                ["home-share-reserved", "home-share-sensitive"]
+            );
+            // A tree of keys is sensitive one directory at a time; the
+            // directories that hold every application's state are not,
+            // since one application's own is what a profile shares.
+            let report = lint(ctx, &["home-share \".ssh/keys\""]);
+            assert_eq!(ids(&report), ["home-share-sensitive"]);
+            assert!(report.findings[0].message.contains("`.ssh`"), "{report:?}");
+            assert_eq!(
+                ids(&lint(ctx, &["home-share \".config/app\" mode=rw"])),
+                [] as [&str; 0]
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["home-share \"Downloads\" mode=rw"])),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    /// bubbler's own directories under the home are refused by the
+    /// launcher, so the linter names them against the node rather than
+    /// letting the run be the first to say so.
+    #[test]
+    fn home_share_reserved_fires_on_the_store_the_layer_and_their_ancestors() {
+        let (_, dir, _) = fake::types();
+        let host = host()
+            .with("/home/user/.local/share", dir)
+            .with("/home/user/.local/share/bubbler", dir)
+            .with("/home/user/.config/bubbler", dir);
+        with(&host, |ctx| {
+            let report = lint(ctx, &["home-share \".local/share/bubbler\" mode=rw"]);
+            assert_eq!(ids(&report), ["home-share-reserved"]);
+            assert_eq!(report.findings[0].severity, Severity::Error);
+            assert!(
+                report.findings[0]
+                    .message
+                    .contains("bubbler never shares /home/user/.local/share/bubbler"),
+                "{report:?}"
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["home-share \".config/bubbler\""])),
+                ["home-share-reserved"]
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["home-share \".local/share\""])),
+                ["home-share-reserved", "home-share-sensitive"]
+            );
+        });
+    }
+
+    /// A directory beside the store is not the store: the check names
+    /// the roots themselves and what contains them, nothing wider.
+    #[test]
+    fn home_share_beside_the_instance_store_is_no_finding() {
+        let (_, dir, _) = fake::types();
+        let host = host()
+            .with("/home/user/.local/share/Other", dir)
+            .with("/home/user/.config/app", dir);
+        with(&host, |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["home-share \".local/share/Other\" mode=rw"])),
+                [] as [&str; 0]
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["home-share \".config/app\""])),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    /// `$BUBBLER_PROFILE_DIR` moves the system profile layer, and both
+    /// share checks follow it there: under the home it is a
+    /// `home-share` away, outside it a `path-share`.
+    #[test]
+    fn the_profile_dir_override_is_reserved_for_both_share_checks() {
+        let (_, dir, _) = fake::types();
+        let host = host()
+            .with("/home/user/myprofiles", dir)
+            .with("/kioxia/profiles", dir);
+        let search = [PathBuf::from("/usr/bin")];
+        let mut inside = env();
+        inside.profile_dir_override = Some(PathBuf::from("/home/user/myprofiles"));
+        let ctx = Context {
+            env: &inside,
+            host: &host,
+            search_path: &search,
+            loaded_revision: &|_: &Env| LoadedRevision::Current,
+            app_id_twin: None,
+        };
+        assert_eq!(
+            ids(&lint(&ctx, &["home-share \"myprofiles\" mode=rw"])),
+            ["home-share-reserved"]
+        );
+        let mut outside = env();
+        outside.profile_dir_override = Some(PathBuf::from("/kioxia/profiles"));
+        let ctx = Context {
+            env: &outside,
+            host: &host,
+            search_path: &search,
+            loaded_revision: &|_: &Env| LoadedRevision::Current,
+            app_id_twin: None,
+        };
+        assert_eq!(
+            ids(&lint(&ctx, &["path-share \"/kioxia/profiles\" mode=rw"])),
+            ["path-share-reserved"]
+        );
+    }
+
+    #[test]
+    fn a_lint_allow_that_accepts_nothing_is_a_note() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["lint-allow \"x11-without-reason\" reason=\"none\""]);
+            assert_eq!(ids(&report), ["lint-allow-unused"]);
+            assert_eq!(report.findings[0].severity, Severity::Note);
+            // One that does accept a finding says nothing, in its own
+            // layer or in another.
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &["x11 \"host\"\nlint-allow \"x11-without-reason\" reason=\"m\""]
+                )),
+                [] as [&str; 0]
+            );
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &[
+                        "lint-allow \"x11-without-reason\" reason=\"m\"",
+                        "x11 \"host\""
+                    ]
+                )),
+                [] as [&str; 0]
+            );
+            // The note is not suppressible by a node of its own: that
+            // node would be the unused one.
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &["lint-allow \"lint-allow-unused\" reason=\"no\""]
+                )),
+                ["lint-allow-unused"]
+            );
+        });
+    }
+
+    #[test]
+    fn reaching_the_secret_service_is_a_note() {
+        with(&host(), |ctx| {
+            // The name is also `dbus-name-is-risky` now (deliberate: both
+            // checks say something true and different about the name).
+            for (rule, name) in [
+                ("talk", "org.freedesktop.secrets"),
+                ("own", "org.freedesktop.secrets"),
+                ("talk", "org.freedesktop.secrets.*"),
+            ] {
+                let text = format!("dbus {{\n    {rule} \"{name}\"\n}}");
+                let report = lint(ctx, &[&text]);
+                assert_eq!(
+                    ids(&report),
+                    ["dbus-name-is-risky", "secrets-access"],
+                    "{text}"
+                );
+                let note = report
+                    .findings
+                    .iter()
+                    .find(|f| f.id == "secrets-access")
+                    .expect("just asserted");
+                assert_eq!(note.severity, Severity::Note);
+                assert!(note.message.contains("login keyring"), "{report:?}");
+            }
+            // The name lives on the session bus; the same string on the
+            // system bus reaches no keyring, but the two proxies share the
+            // one name-risk table.
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &["system-bus {\n    talk \"org.freedesktop.secrets\"\n}"]
+                )),
+                ["dbus-name-is-risky"]
+            );
+        });
+    }
+
+    #[test]
+    fn a_share_whose_source_is_not_on_this_host_is_a_warning() {
+        let (_, dir, _) = fake::types();
+        let host = host()
+            .with("/home/user/Downloads", dir)
+            .with("/etc/vulkan", dir);
+        with(&host, |ctx| {
+            for text in [
+                "home-share \"Games\"",
+                "path-share \"/kioxia/Steam\"",
+                "etc-share \"OpenCL\"",
+            ] {
+                let report = lint(ctx, &[text]);
+                assert_eq!(ids(&report), ["share-source-missing"], "{text}");
+                assert_eq!(report.findings[0].severity, Severity::Warning, "{text}");
+            }
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &["home-share \"Downloads\"\netc-share \"vulkan\""]
+                )),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    /// The launcher skips the bind silently for an optional share with no
+    /// source, so the lint must not warn either — a warning the profile
+    /// cannot avoid would fail R14 for every host lacking the source.
+    #[test]
+    fn an_optional_share_whose_source_is_absent_is_not_a_warning() {
+        let host = host();
+        with(&host, |ctx| {
+            for text in [
+                "home-share \"Games\" optional=#true",
+                "path-share \"/kioxia/Steam\" optional=#true",
+            ] {
+                assert_eq!(ids(&lint(ctx, &[text])), [] as [&str; 0], "{text}");
+            }
+        });
+    }
+
+    /// Without `optional`, the same absent source still fails the run, so
+    /// the warning stays — and now names the alternative the profile has.
+    #[test]
+    fn a_non_optional_share_whose_source_is_absent_names_optional_as_the_fix() {
+        let host = host();
+        with(&host, |ctx| {
+            let report = lint(ctx, &["home-share \"Games\""]);
+            assert_eq!(ids(&report), ["share-source-missing"]);
+            assert!(
+                report.findings[0].help.contains("optional=#true"),
+                "{}",
+                report.findings[0].help
+            );
+        });
+    }
+
+    /// `optional=#true` only silences the missing-source case; a source
+    /// present but of the wrong type still warns.
+    #[test]
+    fn an_optional_share_whose_source_is_the_wrong_type_still_warns() {
+        let (_, _, _, fifo) = fake::every_type();
+        let host = host().with("/kioxia/pipe", fifo);
+        with(&host, |ctx| {
+            let report = lint(ctx, &["path-share \"/kioxia/pipe\" optional=#true"]);
+            assert_eq!(ids(&report), ["share-source-missing"]);
+        });
+    }
+
+    #[test]
+    fn a_share_source_that_is_not_a_directory_or_a_file_is_a_warning() {
+        let (file, dir, sock, fifo) = fake::every_type();
+        let host = FakeHost::default()
+            .with("/usr/bin/foot", file)
+            .with("/home/user/pipe", fifo)
+            .with("/etc/sock", sock)
+            .with("/kioxia/pipe", fifo)
+            .with("/kioxia/sock", sock)
+            .with("/kioxia/data", dir);
+        with(&host, |ctx| {
+            for text in [
+                "home-share \"pipe\"",
+                "etc-share \"sock\"",
+                "path-share \"/kioxia/pipe\"",
+            ] {
+                let report = lint(ctx, &[text]);
+                assert_eq!(ids(&report), ["share-source-missing"], "{text}");
+                assert_eq!(report.findings[0].severity, Severity::Warning, "{text}");
+                assert!(
+                    report.findings[0]
+                        .message
+                        .contains("not a directory or a regular file"),
+                    "{text}: {}",
+                    report.findings[0].message
+                );
+            }
+            // A `path-share` of a socket is named by the check that says
+            // what a shared socket is, not by the type check.
+            assert_eq!(
+                ids(&lint(ctx, &["path-share \"/kioxia/sock\""])),
+                ["path-share-socket"]
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["path-share \"/kioxia/data\""])),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    #[test]
+    fn a_path_share_of_a_root_bubbler_never_shares_is_an_error() {
+        let (_, dir, _) = fake::types();
+        let host = host().with("/home/user", dir).with("/kioxia/Steam", dir);
+        with(&host, |ctx| {
+            let report = lint(ctx, &["path-share \"/home/user\" mode=rw"]);
+            assert_eq!(ids(&report), ["path-share-reserved"]);
+            assert_eq!(report.findings[0].severity, Severity::Error);
+            assert_eq!(
+                ids(&lint(ctx, &["path-share \"/kioxia/Steam\" mode=rw"])),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    #[test]
+    fn a_writable_share_of_a_whole_mounted_filesystem_is_a_warning() {
+        let (_, dir, _) = fake::types();
+        let host = host()
+            .with("/kioxia", dir)
+            .mount("/kioxia")
+            .with("/kioxia/Steam", dir);
+        with(&host, |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["path-share \"/kioxia\" mode=rw"])),
+                ["path-share-mountpoint"]
+            );
+            // Read-only is the case the README already permits, and a
+            // directory on the mount is not the mount.
+            assert_eq!(
+                ids(&lint(ctx, &["path-share \"/kioxia\""])),
+                [] as [&str; 0]
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["path-share \"/kioxia/Steam\" mode=rw"])),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    #[test]
+    fn a_share_that_reaches_a_socket_is_a_warning() {
+        let (file, dir, sock) = fake::types();
+        let host = host()
+            .with("/kioxia/run", dir)
+            .with("/kioxia/run/kitty.sock", sock)
+            .with("/kioxia/data", dir)
+            .with("/kioxia/data/save", file)
+            .with("/kioxia/data/kitty.socket", file);
+        with(&host, |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["path-share \"/kioxia/run\""])),
+                ["path-share-socket"]
+            );
+            // Named like one is enough: the launcher would refuse it, and
+            // a regular file with that name is a socket path in waiting.
+            assert_eq!(
+                ids(&lint(ctx, &["path-share \"/kioxia/data/kitty.socket\""])),
+                ["path-share-socket"]
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["path-share \"/kioxia/data\""])),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    #[test]
+    fn an_own_rule_wider_than_the_application_is_a_warning() {
+        with(&host(), |ctx| {
+            // Neither prefix reaches a name on the new host-exec or risky
+            // tables: this test is about the wildcard's width, not a name.
+            for name in ["net.*", "org.example.*", "com.steampowered.*"] {
+                let text = format!("dbus {{\n    own \"{name}\"\n}}");
+                assert_eq!(ids(&lint(ctx, &[&text])), ["own-too-wide"], "{name}");
+            }
+            for name in ["org.mozilla.firefox.*", "net.lutris.Lutris"] {
+                let text = format!("dbus {{\n    own \"{name}\"\n}}");
+                assert_eq!(ids(&lint(ctx, &[&text])), [] as [&str; 0], "{name}");
+            }
+        });
+    }
+
+    #[test]
+    fn owning_every_media_player_name_is_a_warning() {
+        with(&host(), |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["dbus\nmpris name=\"*\""])),
+                ["mpris-wildcard"]
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["dbus\nmpris name=\"firefox.*\""])),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    #[test]
+    fn talking_to_a_polkit_backed_system_service_is_a_warning() {
+        with(&host(), |ctx| {
+            let text = "system-bus {\n    talk \"org.freedesktop.UDisks2\"\n}";
+            assert_eq!(ids(&lint(ctx, &[text])), ["system-bus-polkit-name"]);
+            // `see` and a narrowed `call` are the forms the shipped
+            // profiles use, and neither reaches a privileged method.
+            let narrow = "system-bus {\n    see \"org.freedesktop.UDisks2\"\n    \
+                          call \"org.freedesktop.UDisks2=org.freedesktop.DBus.ObjectManager.GetManagedObjects@/org/freedesktop/UDisks2\"\n}";
+            assert_eq!(ids(&lint(ctx, &[narrow])), [] as [&str; 0]);
+            let other = "system-bus {\n    talk \"org.freedesktop.UPower\"\n}";
+            assert_eq!(ids(&lint(ctx, &[other])), [] as [&str; 0]);
+            // A glob that covers one is a talk to it.
+            let glob = "system-bus {\n    talk \"org.freedesktop.UDisks2.*\"\n}";
+            assert_eq!(ids(&lint(ctx, &[glob])), ["system-bus-polkit-name"]);
+            let wide = "system-bus {\n    talk \"org.freedesktop.*\"\n}";
+            assert!(ids(&lint(ctx, &[wide])).contains(&"system-bus-polkit-name"));
+        });
+    }
+
+    #[test]
+    fn owning_a_name_on_the_system_bus_is_an_error_the_lint_names() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["system-bus {\n    own \"org.example.App\"\n}"]);
+            assert_eq!(ids(&report), ["own-on-system-bus"]);
+            assert_eq!(report.findings[0].severity, Severity::Error);
+            // The parser refuses the same node; the lint has to reach it
+            // anyway, or the file would only ever be "does not parse".
+            assert!(config::parse("system-bus {\n    own \"org.example.App\"\n}").is_err());
+        });
+    }
+
+    #[test]
+    fn a_bundle_whose_bus_no_layer_grants_is_an_error() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["notify\ntray"]);
+            assert_eq!(ids(&report), ["bundle-without-dbus", "bundle-without-dbus"]);
+            assert_eq!(report.findings[0].severity, Severity::Error);
+            // The `dbus` node may be in any layer, which is exactly the
+            // case one file alone cannot check.
+            assert_eq!(ids(&lint(ctx, &["dbus", "notify"])), [] as [&str; 0]);
+            // The accessibility bus and the input-method names are the
+            // same case: rules with no proxy to carry them.
+            for node in ["a11y", "input-method"] {
+                assert_eq!(ids(&lint(ctx, &[node])), ["bundle-without-dbus"], "{node}");
+                assert_eq!(ids(&lint(ctx, &["dbus", node])), [] as [&str; 0], "{node}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_dbus_grant_that_names_nothing_is_a_warning() {
+        with(&host(), |ctx| {
+            assert_eq!(ids(&lint(ctx, &["dbus"])), ["dbus-without-rules"]);
+            assert_eq!(ids(&lint(ctx, &["dbus", "notify"])), [] as [&str; 0]);
+            assert_eq!(
+                ids(&lint(ctx, &["dbus {\n    talk \"org.example.App\"\n}"])),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    #[test]
+    fn a_name_that_runs_code_on_the_host_is_an_error_on_every_rule_word() {
+        with(&host(), |ctx| {
+            for rule in [
+                "talk \"org.freedesktop.systemd1\"",
+                "see \"org.freedesktop.systemd1\"",
+                "own \"org.freedesktop.Flatpak\"",
+                "call \"org.freedesktop.Flatpak=org.freedesktop.Flatpak.Spawn@/\"",
+                "broadcast \"ca.desrt.dconf=ca.desrt.dconf.Writer.Notify@/\"",
+                "talk \"org.freedesktop.impl.portal.Access\"",
+                // `org.foo.*` matches `org.foo` itself (`xdg-dbus-proxy(1)`).
+                "talk \"org.freedesktop.systemd1.*\"",
+                "talk \"ca.desrt.dconf.*\"",
+                // Glob-aware in both directions: a wildcard that covers a
+                // listed name, and a name covered by a listed wildcard.
+                "talk \"org.freedesktop.*\"",
+                "talk \"org.*\"",
+            ] {
+                let text = format!("dbus {{\n    {rule}\n}}");
+                let report = lint(ctx, &[&text]);
+                assert!(
+                    ids(&report).contains(&"dbus-name-is-host-exec"),
+                    "{rule}: {:?}",
+                    ids(&report)
+                );
+                let f = report
+                    .findings
+                    .iter()
+                    .find(|f| f.id == "dbus-name-is-host-exec")
+                    .expect("just asserted");
+                assert_eq!(f.severity, Severity::Error, "{rule}");
+            }
+
+            // The system bus is filtered by the same proxy and takes the
+            // same list.
+            let text = "system-bus {\n    talk \"org.freedesktop.systemd1\"\n}";
+            assert!(ids(&lint(ctx, &[text])).contains(&"dbus-name-is-host-exec"));
+
+            // A name that is none of them is not one.
+            let text = "dbus {\n    talk \"org.freedesktop.UPower\"\n}";
+            assert!(!ids(&lint(ctx, &[text])).contains(&"dbus-name-is-host-exec"));
+        });
+    }
+
+    #[test]
+    fn a_risky_name_is_a_warning_that_says_what_the_name_does() {
+        with(&host(), |ctx| {
+            for (rule, says) in [
+                ("talk \"org.kde.KWin\"", "window"),
+                ("talk \"org.gnome.Shell\"", "shell"),
+                ("talk \"org.freedesktop.FileManager1\"", "file manager"),
+                ("talk \"org.freedesktop.secrets\"", "keyring"),
+            ] {
+                let text = format!("dbus {{\n    {rule}\n}}");
+                let report = lint(ctx, &[&text]);
+                let f = report
+                    .findings
+                    .iter()
+                    .find(|f| f.id == "dbus-name-is-risky")
+                    .unwrap_or_else(|| panic!("{rule}: {:?}", ids(&report)));
+                assert_eq!(f.severity, Severity::Warning, "{rule}");
+                assert!(
+                    f.message.to_lowercase().contains(says),
+                    "{rule}: {}",
+                    f.message
+                );
+            }
+        });
+    }
+
+    /// A warning can be accepted; the error cannot.
+    #[test]
+    fn the_risky_warning_is_suppressible_and_the_host_exec_error_is_not() {
+        with(&host(), |ctx| {
+            let text = "lint-allow \"dbus-name-is-risky\" reason=\"this app is the file manager\"\n\
+                        dbus {\n    talk \"org.freedesktop.FileManager1\"\n}";
+            assert!(!ids(&lint(ctx, &[text])).contains(&"dbus-name-is-risky"));
+
+            let text = "lint-allow \"dbus-name-is-host-exec\" reason=\"no\"\n\
+                        dbus {\n    talk \"org.freedesktop.systemd1\"\n}";
+            assert!(ids(&lint(ctx, &[text])).contains(&"dbus-name-is-host-exec"));
+        });
+    }
+
+    #[test]
+    fn a_portal_rule_without_the_portals_grant_is_a_warning() {
+        with(&host(), |ctx| {
+            let text = "dbus {\n    talk \"org.freedesktop.portal.Desktop\"\n}";
+            assert_eq!(ids(&lint(ctx, &[text])), ["portal-talk-without-portals"]);
+            let text = "dbus {\n    talk \"org.freedesktop.*\"\n}";
+            assert!(
+                ids(&lint(ctx, &[text])).contains(&"portal-talk-without-portals"),
+                "{text}"
+            );
+        });
+    }
+
+    #[test]
+    fn following_the_portal_rule_help_gives_a_config_that_parses() {
+        with(&host(), |ctx| {
+            for rule in [
+                "talk \"org.freedesktop.*\"",
+                "talk \"org.freedesktop.portal.Desktop\"",
+                "call \"org.freedesktop.portal.Desktop=*\"",
+                "call \"org.freedesktop.portal.Desktop=org.freedesktop.portal.FileChooser.*\"",
+            ] {
+                let text = format!("dbus {{\n    {rule}\n}}\n");
+                let report = lint(ctx, &[&text]);
+                let help = &report
+                    .findings
+                    .iter()
+                    .find(|f| f.id == "portal-talk-without-portals")
+                    .unwrap_or_else(|| panic!("{rule}: {report:?}"))
+                    .help;
+                let followed = if help.starts_with("add `portals`") {
+                    format!("{text}portals\n")
+                } else {
+                    assert!(
+                        help.starts_with("replace the rule with `portals`"),
+                        "{help}"
+                    );
+                    format!("{}portals\n", text.replace(&format!("    {rule}\n"), ""))
+                };
+                assert!(
+                    config::parse(&followed).is_ok(),
+                    "{rule}: {help}: {followed}"
+                );
+            }
+        });
+    }
+
+    /// Beside `portals` the same rule is no warning but a config the
+    /// parser refuses, and the run says so instead of a clean report.
+    #[test]
+    fn a_portal_talk_beside_the_portals_grant_fails_the_run() {
+        with(&host(), |ctx| {
+            let text = "dbus {\n    talk \"org.freedesktop.portal.Desktop\"\n}\nportals".to_owned();
+            let err = lint_text(ctx, Where::File("/p/0.kdl".into()), text).unwrap_err();
+            assert!(
+                matches!(&err, LintError::Config(crate::error::ConfigError::BadArgument { reason, .. })
+                    if reason.contains("undoes `portals`")),
+                "{err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn one_bus_name_given_two_policies_across_layers_is_an_error() {
+        with(&host(), |ctx| {
+            let report = lint(
+                ctx,
+                &[
+                    "dbus {\n    see \"org.example.App\"\n}",
+                    "dbus {\n    talk \"org.example.App\"\n}",
+                ],
+            );
+            assert_eq!(ids(&report), ["dup-name-policy"]);
+            assert_eq!(report.findings[0].severity, Severity::Error);
+            // Named against the layer that wrote the second policy, with
+            // the first layer in the message.
+            assert_eq!(report.findings[0].at, Where::File("/p/1.kdl".into()));
+            assert!(
+                report.findings[0].message.contains("/p/0.kdl"),
+                "{report:?}"
+            );
+            // One layer holding both is the same error without a second
+            // file to name.
+            let report = lint(
+                ctx,
+                &["dbus {\n    see \"org.example.App\"\n    talk \"org.example.App\"\n}"],
+            );
+            assert_eq!(ids(&report), ["dup-name-policy"]);
+            assert!(
+                report.findings[0].message.contains("twice in this file"),
+                "{report:?}"
+            );
+            // The same policy twice is a repeat, not a conflict, and the
+            // two buses are separate filters.
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &[
+                        "dbus {\n    see \"org.freedesktop.UDisks2\"\n}",
+                        "system-bus {\n    talk \"org.example.Other\"\n}",
+                    ]
+                )),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    #[test]
+    fn disabling_user_namespaces_under_a_nesting_command_is_a_warning() {
+        let (file, _, _) = fake::types();
+        let host = FakeHost::default()
+            .with("/usr/bin/chromium", file)
+            .with("/usr/bin/foot", file);
+        with(&host, |ctx| {
+            let report = lint(ctx, &["userns \"disable\"\ncommand \"chromium\""]);
+            assert_eq!(ids(&report), ["userns-disabled-with-nested-sandbox"]);
+            let finding = &report.findings[0];
+            assert!(
+                finding
+                    .message
+                    .contains("the new mount API a nested sandbox needs is denied as well"),
+                "{}",
+                finding.message
+            );
+            assert!(finding.help.contains("--explain=full"), "{}", finding.help);
+            assert_eq!(
+                ids(&lint(ctx, &["userns \"disable\"\ncommand \"foot\""])),
+                [] as [&str; 0]
+            );
+            assert_eq!(
+                ids(&lint(ctx, &["userns \"allow\"\ncommand \"chromium\""])),
+                [] as [&str; 0]
+            );
+            // The last layer to write the node is the one that decides.
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &[
+                        "userns \"disable\"",
+                        "userns \"allow\"\ncommand \"chromium\""
+                    ]
+                )),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    #[test]
+    fn a_desktop_hint_naming_no_entry_on_this_host_is_a_note() {
+        let (file, _, _) = fake::types();
+        let system = host().with("/usr/share/applications/org.example.App.desktop", file);
+        with(&system, |ctx| {
+            let report = lint(ctx, &["desktop \"org.example.Other.desktop\""]);
+            assert_eq!(ids(&report), ["desktop-entry-missing"]);
+            assert_eq!(report.findings[0].severity, Severity::Note);
+            assert_eq!(
+                ids(&lint(ctx, &["desktop \"org.example.App.desktop\""])),
+                [] as [&str; 0]
+            );
+        });
+        // The user's own applications directory counts too.
+        let mine = host().with(
+            "/home/user/.local/share/applications/org.example.Mine.desktop",
+            file,
+        );
+        with(&mine, |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["desktop \"org.example.Mine.desktop\""])),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    #[test]
+    fn a_command_this_host_does_not_have_is_a_note() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["command \"keepassxc\""]);
+            assert_eq!(ids(&report), ["command-not-found"]);
+            assert_eq!(report.findings[0].severity, Severity::Note);
+            assert_eq!(ids(&lint(ctx, &["command \"foot\""])), [] as [&str; 0]);
+            assert_eq!(
+                ids(&lint(ctx, &["command \"/usr/bin/foot\""])),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    /// A profile writes `command` for the inside of the sandbox, where
+    /// the home is `SANDBOX_HOME`, and the file it names lives under the
+    /// host's own `$HOME` — but only a `home-share` puts it inside, so
+    /// the same host file is a missing command without one.
+    #[test]
+    fn a_command_under_the_sandbox_home_needs_a_home_share_to_be_found() {
+        let (file, dir, _) = fake::types();
+        let path = |p: &Path| p.to_str().expect("the test home is UTF-8").to_owned();
+        let bin = env().home.join(".local/bin");
+        let host = host()
+            .with(&path(&bin), dir)
+            .with(&path(&bin.join("tool")), file);
+        with(&host, |ctx| {
+            // The share itself, and a share of the directory above it.
+            for share in [
+                "home-share \".local/bin/tool\" mode=ro\n",
+                "home-share \".local/bin\" mode=ro\n",
+            ] {
+                let found = format!("{share}command \"/home/bubbler/.local/bin/tool\"");
+                assert_eq!(ids(&lint(ctx, &[&found])), [] as [&str; 0], "{found}");
+                let missing = format!("{share}command \"/home/bubbler/.local/bin/other\"");
+                assert_eq!(
+                    ids(&lint(ctx, &[&missing])),
+                    ["command-not-found"],
+                    "{missing}"
+                );
+            }
+            // The host has the file; no node binds it in, so the sandbox
+            // has no such command.
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &["network\ncommand \"/home/bubbler/.local/bin/tool\""]
+                )),
+                ["command-not-found"]
+            );
+        });
+    }
+
+    #[test]
+    fn lint_allow_never_silences_an_error() {
+        with(&host(), |ctx| {
+            // The parser refuses the node for an error check, so the only
+            // way to write one is a warning id, which leaves the error.
+            let report = lint(
+                ctx,
+                &["notify\nlint-allow \"bundle-without-dbus\" reason=\"no\""],
+            );
+            // The error stands, and the node that tried to accept it is
+            // reported as accepting nothing.
+            assert_eq!(ids(&report), ["bundle-without-dbus", "lint-allow-unused"]);
+            assert!(config::parse("lint-allow \"bundle-without-dbus\" reason=\"no\"").is_err());
+        });
+    }
+
+    #[test]
+    fn findings_come_out_in_file_order_and_point_at_the_node() {
+        with(&host(), |ctx| {
+            let report = lint(
+                ctx,
+                &[
+                    "wayland\n  x11 \"host\"\ndbus {\n    own \"org.example.*\"\n}\ntty \"passthrough\"",
+                ],
+            );
+            assert_eq!(
+                ids(&report),
+                ["x11-without-reason", "own-too-wide", "tty-passthrough"]
+            );
+            // A rule inside a block points at the rule, not at the block.
+            let at: Vec<(Option<u32>, Option<u32>)> =
+                report.findings.iter().map(|f| (f.line, f.col)).collect();
+            assert_eq!(
+                at,
+                [(Some(2), Some(3)), (Some(4), Some(5)), (Some(6), Some(1))]
+            );
+        });
+    }
+
+    /// The line and column a finding names are counted by the newlines
+    /// KDL reads, not by line feeds alone: a file written with carriage
+    /// returns is one line to `str::lines` and six to the parser, and a
+    /// finding that points at line 1 of it sends the reader nowhere.
+    #[test]
+    fn a_finding_counts_every_newline_kdl_reads() {
+        with(&host(), |ctx| {
+            let lines = [
+                "wayland",
+                "  x11 \"host\"",
+                "dbus {",
+                "    own \"org.example.*\"",
+                "}",
+                "tty \"passthrough\"",
+            ];
+            for nl in ["\n", "\r", "\r\n", "\u{b}", "\u{c}", "\u{85}", "\u{2028}"] {
+                let text = lines.join(nl);
+                let report = lint(ctx, &[text.as_str()]);
+                assert_eq!(
+                    ids(&report),
+                    ["x11-without-reason", "own-too-wide", "tty-passthrough"],
+                    "{nl:?}"
+                );
+                let at: Vec<(Option<u32>, Option<u32>)> =
+                    report.findings.iter().map(|f| (f.line, f.col)).collect();
+                assert_eq!(
+                    at,
+                    [(Some(2), Some(3)), (Some(4), Some(5)), (Some(6), Some(1))],
+                    "{nl:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_built_in_layer_has_no_line_to_point_at() {
+        with(&host(), |ctx| {
+            let source = Source::read(
+                Where::BuiltIn("steam".to_owned()),
+                "x11 \"host\"".to_owned(),
+            )
+            .expect("valid KDL");
+            let report = run(ctx, std::slice::from_ref(&source));
+            assert_eq!(
+                (report.findings[0].line, report.findings[0].col),
+                (None, None)
+            );
+            assert_eq!(
+                render_finding(&report.findings[0])[0].to_string_lossy(),
+                "built-in:steam: warning[x11-without-reason]: `x11 \"host\"` hands over the \
+                 session X socket: every X client can read every other's input and windows, \
+                 Xwayland included, and the compositor's security context does not apply"
+            );
+        });
+    }
+
+    #[test]
+    fn exit_codes_follow_the_worst_finding() {
+        let clean = Report::default();
+        assert_eq!(exit_code(&clean, false), 0);
+        assert_eq!(exit_code(&clean, true), 0);
+        with(&host(), |ctx| {
+            let note = lint(ctx, &["command \"keepassxc\""]);
+            assert_eq!(exit_code(&note, true), 0);
+            let warning = lint(ctx, &["x11 \"host\""]);
+            assert_eq!(exit_code(&warning, false), 1);
+            assert_eq!(exit_code(&warning, true), 2);
+            let error = lint(ctx, &["x11 \"host\"\nnotify"]);
+            assert_eq!(exit_code(&error, false), 2);
+        });
+    }
+
+    #[test]
+    fn the_text_report_is_the_shape_an_editor_parses() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["x11 \"host\"\ncommand \"keepassxc\""]);
+            let lines: Vec<String> = render_text(&report)
+                .iter()
+                .map(|l| l.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                lines,
+                vec![
+                    "/p/0.kdl:1:1: warning[x11-without-reason]: `x11 \"host\"` hands over the \
+                     session X socket: every X client can read every other's input and windows, \
+                     Xwayland included, and the compositor's security context does not apply"
+                        .to_owned(),
+                    "  help: drop the argument for a nested Xwayland inside the sandbox, or \
+                     accept it with `lint-allow \"x11-without-reason\" reason=\"...\"`"
+                        .to_owned(),
+                    "/p/0.kdl:2:1: note[command-not-found]: `keepassxc` is not on this host's PATH"
+                        .to_owned(),
+                    "  help: a profile may be written for software you have not installed; \
+                     otherwise fix the `command` node"
+                        .to_owned(),
+                    String::new(),
+                    "1 layer linted, 0 errors, 1 warning, 1 note".to_owned(),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn the_json_report_is_one_object_per_finding_and_a_summary() {
+        with(&host(), |ctx| {
+            let report = lint(ctx, &["tty \"passthrough\""]);
+            assert_eq!(
+                render_json(&report),
+                "[\n  {\"file\": \"/p/0.kdl\", \"line\": 1, \"col\": 1, \"severity\": \
+                 \"warning\", \"check\": \"tty-passthrough\", \"message\": \
+                 \"`tty \\\"passthrough\\\"` hands the sandbox this terminal's own \
+                 descriptors\", \"help\": \"leave the default `pty` unless the command has \
+                 to share the caller's terminal\"},\n  {\"layers\": 1, \"errors\": 0, \
+                 \"warnings\": 1, \"notes\": 0}\n]\n"
+            );
+            assert_eq!(
+                render_json(&Report::default()),
+                "[\n  {\"layers\": 0, \"errors\": 0, \"warnings\": 0, \"notes\": 0}\n]\n"
+            );
+        });
+    }
+
+    /// No drop-in anywhere is the default fixture (`host()`), so the
+    /// warning fires for either audio node, names the node and every
+    /// directory bubbler searched, and points the help at the command
+    /// that writes the file and the restart it needs.
+    #[test]
+    fn audio_policy_missing_fires_without_the_drop_in_and_names_where_to_put_it() {
+        with(&host(), |ctx| {
+            for node in ["pipewire", "pulseaudio"] {
+                let report = lint(ctx, &[node]);
+                assert_eq!(ids(&report), ["audio-policy-missing"], "{node}");
+                let finding = &report.findings[0];
+                assert_eq!(finding.severity, Severity::Warning, "{node}");
+                assert!(finding.message.contains(node), "{node}: {finding:?}");
+                for dir in [
+                    "/home/user/.config/wireplumber/wireplumber.conf.d",
+                    "/etc/xdg/wireplumber/wireplumber.conf.d",
+                    "/etc/wireplumber/wireplumber.conf.d",
+                    "/usr/local/share/wireplumber/wireplumber.conf.d",
+                    "/usr/share/wireplumber/wireplumber.conf.d",
+                ] {
+                    assert!(finding.message.contains(dir), "{node}: {finding:?}");
+                }
+                assert!(
+                    finding.help.contains("bubbler audio-policy --print >"),
+                    "{node}: {finding:?}"
+                );
+                assert!(
+                    finding.help.contains("restart WirePlumber"),
+                    "{node}: {finding:?}"
+                );
+            }
+            assert_eq!(ids(&lint(ctx, &["wayland"])), [] as [&str; 0]);
+        });
+    }
+
+    /// Whichever directory WirePlumber reads the drop-in from holds it,
+    /// with the hook beside it the grant is scoped and the warning is
+    /// silent.
+    #[test]
+    fn audio_policy_missing_is_silenced_by_any_install_directory() {
+        let (file, _, _) = fake::types();
+        for dir in [
+            "/home/user/.config/wireplumber/wireplumber.conf.d",
+            "/etc/xdg/wireplumber/wireplumber.conf.d",
+            "/etc/wireplumber/wireplumber.conf.d",
+            "/usr/local/share/wireplumber/wireplumber.conf.d",
+            "/usr/share/wireplumber/wireplumber.conf.d",
+        ] {
+            let quiet = host()
+                .with(&format!("{dir}/50-bubbler.conf"), file)
+                .text(&format!("{dir}/50-bubbler.conf"), audio_policy::DROP_IN)
+                .with(HOOK_PATH, file)
+                .text(HOOK_PATH, audio_policy::HOOK);
+            with(&quiet, |ctx| {
+                assert_eq!(ids(&lint(ctx, &["pipewire"])), [] as [&str; 0], "{dir}");
+            });
+        }
+    }
+
+    /// Half a policy is its own finding: which file to write is what the
+    /// reader needs, and the two go in directories of different kinds.
+    #[test]
+    fn audio_policy_missing_names_the_half_that_is_absent() {
+        let (file, _, _) = fake::types();
+        let drop_in = "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf";
+        for (held, named, unnamed, text) in [
+            (
+                drop_in,
+                "bubbler/refuse-links.lua",
+                "50-bubbler.conf",
+                audio_policy::DROP_IN,
+            ),
+            (
+                HOOK_PATH,
+                "50-bubbler.conf",
+                "bubbler/refuse-links.lua",
+                audio_policy::HOOK,
+            ),
+        ] {
+            let half = host().with(held, file).text(held, text);
+            with(&half, |ctx| {
+                let report = lint(ctx, &["pipewire"]);
+                assert_eq!(ids(&report), ["audio-policy-missing"], "{held}");
+                let finding = &report.findings[0];
+                assert!(finding.message.contains(named), "{held}: {finding:?}");
+                assert!(!finding.message.contains(unnamed), "{held}: {finding:?}");
+                assert!(finding.help.contains(named), "{held}: {finding:?}");
+                assert!(
+                    finding.help.contains("restart WirePlumber"),
+                    "{held}: {finding:?}"
+                );
+            });
+        }
+    }
+
+    /// The drop-in an older bubbler's and the hook missing: both findings.
+    #[test]
+    fn a_stale_drop_in_beside_a_missing_hook_is_both_findings() {
+        let (file, _, _) = fake::types();
+        let drop_in = "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf";
+        let stale = host()
+            .with(drop_in, file)
+            .text(drop_in, "# an older bubbler's copy\n");
+        with(&stale, |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["pipewire"])),
+                ["audio-policy-missing", "audio-policy-differs"]
+            );
+        });
+    }
+
+    fn whole_policy() -> FakeHost {
+        let (file, _, _) = fake::types();
+        let drop_in = "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf";
+        host()
+            .with(drop_in, file)
+            .text(drop_in, audio_policy::DROP_IN)
+            .with(HOOK_PATH, file)
+            .text(HOOK_PATH, audio_policy::HOOK)
+    }
+
+    fn lint_loaded(host: &dyn Host, loaded: LoadedRevision, layers: &[&str]) -> Report {
+        let e = env();
+        let path = [PathBuf::from("/usr/bin")];
+        let read = |_: &Env| loaded.clone();
+        lint(
+            &Context {
+                env: &e,
+                host,
+                search_path: &path,
+                loaded_revision: &read,
+                app_id_twin: None,
+            },
+            layers,
+        )
+    }
+
+    #[test]
+    fn a_policy_not_loaded_is_a_warning_naming_the_restart() {
+        for loaded in [
+            LoadedRevision::Absent,
+            LoadedRevision::Other("7".to_owned()),
+        ] {
+            let report = lint_loaded(&whole_policy(), loaded.clone(), &["pipewire"]);
+            assert_eq!(ids(&report), ["audio-policy-not-loaded"], "{loaded:?}");
+            let finding = &report.findings[0];
+            assert_eq!(finding.severity, Severity::Warning, "{loaded:?}");
+            assert!(
+                finding
+                    .message
+                    .contains(&loaded.not_loaded().expect("a cause")),
+                "{finding:?}"
+            );
+            assert!(
+                finding
+                    .help
+                    .contains("systemctl --user restart wireplumber"),
+                "{finding:?}"
+            );
+        }
+        let report = lint_loaded(&whole_policy(), LoadedRevision::Current, &["pipewire"]);
+        assert_eq!(ids(&report), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn a_loaded_policy_not_known_is_a_note_naming_why() {
+        let reason = "/usr/bin/pw-dump exit status: 255: can't connect: Host is down";
+        let report = lint_loaded(
+            &whole_policy(),
+            LoadedRevision::Unknown(reason.to_owned()),
+            &["pulseaudio"],
+        );
+        assert_eq!(ids(&report), ["audio-policy-not-loaded"]);
+        let finding = &report.findings[0];
+        assert_eq!(finding.severity, Severity::Note);
+        assert!(finding.message.contains(reason), "{finding:?}");
+    }
+
+    #[test]
+    fn a_loaded_policy_that_could_not_be_read_is_a_warning_naming_why() {
+        let reason = "/usr/bin/pw-dump printed more than 1048576 bytes";
+        let loaded = LoadedRevision::Unreadable(reason.to_owned());
+        let report = lint_loaded(&whole_policy(), loaded, &["pipewire"]);
+        assert_eq!(ids(&report), ["audio-policy-not-loaded"]);
+        let finding = &report.findings[0];
+        assert_eq!(finding.severity, Severity::Warning);
+        assert!(
+            finding.message.contains("could not be verified"),
+            "{finding:?}"
+        );
+        assert!(finding.message.contains(reason), "{finding:?}");
+    }
+
+    #[test]
+    fn the_loaded_policy_is_asked_only_of_an_audio_grant_with_the_whole_policy() {
+        let e = env();
+        let path = [PathBuf::from("/usr/bin")];
+        let unasked = |_: &Env| -> LoadedRevision { panic!("the reader was asked") };
+        for (host, layer, expected) in [
+            (whole_policy(), "wayland", &[][..]),
+            (host(), "pipewire", &["audio-policy-missing"][..]),
+        ] {
+            let ctx = Context {
+                env: &e,
+                host: &host,
+                search_path: &path,
+                loaded_revision: &unasked,
+                app_id_twin: None,
+            };
+            assert_eq!(ids(&lint(&ctx, &[layer])), expected, "{layer}");
+        }
+    }
+
+    #[test]
+    fn a_differing_copy_holds_the_not_loaded_finding_back_unless_accepted() {
+        let drop_in = "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf";
+        let differs = whole_policy().text(drop_in, "# another version\n");
+        let report = lint_loaded(&differs, LoadedRevision::Absent, &["pipewire"]);
+        assert_eq!(ids(&report), ["audio-policy-differs"]);
+        let report = lint_loaded(
+            &differs,
+            LoadedRevision::Absent,
+            &["pipewire\nlint-allow \"audio-policy-differs\" reason=\"kept on purpose\""],
+        );
+        assert_eq!(ids(&report), ["audio-policy-not-loaded"]);
+    }
+
+    #[test]
+    fn a_policy_not_loaded_is_accepted_with_a_lint_allow() {
+        for loaded in [
+            LoadedRevision::Absent,
+            LoadedRevision::Unknown("x".to_owned()),
+            LoadedRevision::Unreadable("x".to_owned()),
+        ] {
+            let report = lint_loaded(
+                &whole_policy(),
+                loaded,
+                &["pipewire\nlint-allow \"audio-policy-not-loaded\" reason=\"restarted later\""],
+            );
+            assert_eq!(ids(&report), [] as [&str; 0]);
+        }
+    }
+
+    #[test]
+    fn audio_policy_missing_is_accepted_with_a_lint_allow() {
+        with(&host(), |ctx| {
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &["pulseaudio\nlint-allow \"audio-policy-missing\" \
+                         reason=\"packaged host\""]
+                )),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    /// `pipewire` and `pulseaudio` share one instance-wide audio reach
+    /// (`InstanceConfig::audio` ORs them), so a config granting both
+    /// gets one missing-drop-in finding, not one per node.
+    #[test]
+    fn audio_policy_missing_fires_once_for_a_config_granting_both_nodes() {
+        with(&host(), |ctx| {
+            assert_eq!(
+                ids(&lint(ctx, &["pipewire\npulseaudio"])),
+                ["audio-policy-missing"]
+            );
+        });
+    }
+
+    #[test]
+    fn every_builtin_profile_lints_clean() {
+        // The host is built from what each profile asks for, so the run
+        // measures the grants rather than this machine's directories.
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let mut e = env();
+        e.config_home = tmp.path().join("config");
+        e.profile_dir_override = Some(tmp.path().join("system"));
+        let resolver = Resolver::new(&e);
+        let search_path = [PathBuf::from("/usr/bin")];
+        let (file, dir, _) = fake::types();
+        for name in profile::NAMES {
+            let text = profile::lookup(name).expect("NAMES lists built-in profiles");
+            let cfg = config::parse_profile(text)
+                .unwrap_or_else(|err| panic!("{name}: {err}"))
+                .config;
+            // This measures the profiles' own grants, not whether this
+            // host has the WirePlumber drop-in installed — otherwise
+            // every `pipewire`/`pulseaudio` grant would carry
+            // `audio-policy-missing` regardless of what the profile asks.
+            let mut host = FakeHost::default()
+                .with(
+                    "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+                    file,
+                )
+                .text(
+                    "/usr/share/wireplumber/wireplumber.conf.d/50-bubbler.conf",
+                    audio_policy::DROP_IN,
+                )
+                .with(HOOK_PATH, file)
+                .text(HOOK_PATH, audio_policy::HOOK);
+            let mut add = |p: &Path, t| {
+                host = std::mem::take(&mut host)
+                    .with(p.to_str().expect("built-in profiles hold UTF-8 paths"), t);
+            };
+            for s in &cfg.services {
+                match s {
+                    Service::HomeShare { path, .. } => add(&e.home.join(path), dir),
+                    Service::PathShare { path, .. } => add(path, dir),
+                    Service::EtcShare { name } => add(&Path::new("/etc").join(name), dir),
+                    _ => {}
+                }
+            }
+            if let Some(argv) = &cfg.command {
+                let argv0 = argv[0].to_str().expect("built-in commands hold UTF-8");
+                add(&Path::new("/usr/bin").join(argv0), file);
+            }
+            if let Some(entry) = &cfg.desktop {
+                add(&Path::new("/usr/share/applications").join(entry), file);
+            }
+            let ctx = Context {
+                env: &e,
+                host: &host,
+                search_path: &search_path,
+                loaded_revision: &|_: &Env| LoadedRevision::Current,
+                app_id_twin: None,
+            };
+            let report =
+                lint_profile(&ctx, &resolver, name).unwrap_or_else(|err| panic!("{name}: {err}"));
+            // vesktop's own comment explains the `microphone` child it
+            // carries, which R14 allows: a note, not a defect.
+            let expected = if name == &"vesktop" {
+                vec![
+                    "note[pipewire-microphone]: `pulseaudio { microphone }` adds every \
+                     microphone and line-in the session has, and capture from them"
+                        .to_owned(),
+                ]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                report
+                    .findings
+                    .iter()
+                    .map(|f| format!("{}[{}]: {}", f.severity, f.id, f.message))
+                    .collect::<Vec<_>>(),
+                expected,
+                "{name} does not lint clean"
+            );
+        }
+    }
+
+    /// A resolver over `<tmp>` with `files` written into the user layer,
+    /// and the environment it was built from.
+    fn profiles(tmp: &Path, files: &[(&str, &str)]) -> (Env, Resolver) {
+        let mut e = env();
+        e.config_home = tmp.join("config");
+        e.profile_dir_override = Some(tmp.join("system"));
+        let r = Resolver::new(&e);
+        std::fs::create_dir_all(r.user_dir()).expect("a writable temp dir");
+        for (name, text) in files {
+            std::fs::write(r.user_dir().join(format!("{name}.kdl")), text)
+                .expect("a writable temp dir");
+        }
+        (e, r)
+    }
+
+    #[test]
+    fn an_error_that_is_not_the_parser_s_leaves_a_parse_failure_to_stop_the_run() {
+        // The share error is real, and it says nothing about why the
+        // layer above it will not parse, so the run reports the parse
+        // failure rather than a verdict built on half the file.
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let (e, r) = profiles(
+            tmp.path(),
+            &[
+                ("base", "home-share \"NoSuchDir\"\n"),
+                ("app", "include \"base\"\nbluetooth\n"),
+            ],
+        );
+        let host = host();
+        let search = [PathBuf::from("/usr/bin")];
+        let ctx = Context {
+            env: &e,
+            host: &host,
+            search_path: &search,
+            loaded_revision: &|_: &Env| LoadedRevision::Current,
+            app_id_twin: None,
+        };
+        let err = lint_profile(&ctx, &r, "app").expect_err("`bluetooth` is not a node");
+        assert!(matches!(err, LintError::Profile(_)), "{err:?}");
+        // An error the parser raises itself does explain it, so that one
+        // is a report and not a failed run.
+        let report = lint_text(
+            &ctx,
+            Where::File("/p/0.kdl".into()),
+            "system-bus {\n    own \"org.example.App\"\n}".to_owned(),
+        )
+        .expect("the finding says why the parser refuses it");
+        assert_eq!(ids(&report), ["own-on-system-bus"]);
+    }
+
+    #[test]
+    fn folding_two_reports_together_counts_a_shared_layer_once() {
+        // `--all` reads a base profile once per profile that includes it,
+        // and neither the layer nor what was found in it is doubled.
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let (e, r) = profiles(
+            tmp.path(),
+            &[
+                ("base", "x11 \"host\"\ncommand \"foot\"\n"),
+                ("a", "include \"base\"\n"),
+                ("b", "include \"base\"\n"),
+            ],
+        );
+        let host = host();
+        let search = [PathBuf::from("/usr/bin")];
+        let ctx = Context {
+            env: &e,
+            host: &host,
+            search_path: &search,
+            loaded_revision: &|_: &Env| LoadedRevision::Current,
+            app_id_twin: None,
+        };
+        let mut all = Report::default();
+        for name in ["a", "b"] {
+            all.absorb(lint_profile(&ctx, &r, name).unwrap_or_else(|e| panic!("{name}: {e}")));
+        }
+        assert_eq!(ids(&all), ["x11-without-reason"]);
+        assert_eq!(all.layers.len(), 3);
+        assert_eq!(
+            summary(&all),
+            "3 layers linted, 0 errors, 1 warning, 0 notes"
+        );
+    }
+
+    #[test]
+    fn a_layer_no_check_explains_stops_the_run_rather_than_reading_clean() {
+        with(&host(), |ctx| {
+            let err = lint_text(ctx, Where::File("/p/0.kdl".into()), "bluetooth".to_owned())
+                .expect_err("an unknown node is not a clean config");
+            assert!(matches!(err, LintError::Config(_)), "{err:?}");
+        });
+    }
+
+    /// Every check reads a block the way it reads the lines it stands
+    /// for: a form that hid `home-share-reserved` would be a way to
+    /// write a config the linter never looked at.
+    #[test]
+    fn the_checks_read_a_block_as_the_lines_it_stands_for() {
+        let (_, dir, _) = fake::types();
+        let host = host()
+            .with("/home/user/.config", dir)
+            .with("/home/user/.ssh", dir)
+            .with("/home/user/Downloads", dir);
+        with(&host, |ctx| {
+            let lines_report = lint(ctx, &["home-share \".config\" mode=rw"]);
+            let lines = ids(&lines_report);
+            let block_report = lint(ctx, &["home-share {\n    \".config\" mode=rw\n}"]);
+            let block = ids(&block_report);
+            assert_eq!(lines, block);
+            assert!(block.contains(&"home-share-sensitive"), "{block:?}");
+            // The reserved check is an error and cannot be silenced, so
+            // a form that hid it would be a way past it.
+            let reserved_report = lint(
+                ctx,
+                &["home-share {\n    \".local/share/bubbler\" mode=rw\n}"],
+            );
+            let reserved = ids(&reserved_report);
+            assert!(reserved.contains(&"home-share-reserved"), "{reserved:?}");
+            // A `lint-allow` written in a block silences what it names.
+            // `.ssh` rather than `.config`: `.config` is also
+            // `home-share-reserved` under this env's default profile
+            // dir, and that check is an error a `lint-allow` cannot
+            // silence — this assertion is about the warning alone.
+            assert_eq!(
+                ids(&lint(
+                    ctx,
+                    &[
+                        "lint-allow {\n    \"home-share-sensitive\" reason=\"the app is the \
+                       owner of that directory\"\n}\nhome-share \".ssh\" mode=rw"
+                    ]
+                )),
+                [] as [&str; 0]
+            );
+        });
+    }
+
+    /// A finding in a block points at the entry, not at the line the
+    /// block opens on.
+    #[test]
+    fn a_block_finding_points_at_the_entry() {
+        let (_, dir, _) = fake::types();
+        let host = host().with("/home/user/.config", dir);
+        with(&host, |ctx| {
+            let report = lint(
+                ctx,
+                &["wayland\nhome-share {\n    \"Downloads\" mode=rw\n    \".config\" mode=rw\n}"],
+            );
+            let f = report
+                .findings
+                .iter()
+                .find(|f| f.id == "home-share-sensitive")
+                .expect("the sensitive share is found");
+            assert_eq!(f.line, Some(4));
+        });
+    }
+
+    /// Two line-form nodes of one kind: one block writes the same
+    /// grants, and the note shows it.
+    #[test]
+    fn repeat_outside_block_offers_the_block() {
+        with(&host(), |ctx| {
+            let report = lint(
+                ctx,
+                &["home-share \".local/bin/claude\" mode=ro\n\
+                   home-share \".local/share/claude\" mode=ro"],
+            );
+            let f = report
+                .findings
+                .iter()
+                .find(|f| f.id == "repeat-outside-block")
+                .expect("the note is raised");
+            assert_eq!(f.severity, Severity::Note);
+            assert_eq!(f.line, Some(1));
+            assert_eq!(f.message, "`home-share` is written 2 times, one node each");
+            assert_eq!(
+                f.help,
+                "write them as one block: `home-share { \".local/bin/claude\" mode=ro; \
+                 \".local/share/claude\" mode=ro }`"
+            );
+            // One node raises nothing, and the block raises nothing.
+            assert!(!ids(&lint(ctx, &["home-share \"a\""])).contains(&"repeat-outside-block"));
+            assert!(
+                !ids(&lint(ctx, &["home-share {\n    \"a\"\n    \"b\"\n}"]))
+                    .contains(&"repeat-outside-block")
+            );
+            // `env` is offered in the child's own spelling.
+            let report = lint(ctx, &["env A=\"1\"\nenv B=\"2\""]);
+            let f = report
+                .findings
+                .iter()
+                .find(|f| f.id == "repeat-outside-block")
+                .expect("the note is raised for env");
+            assert_eq!(
+                f.help,
+                "write them as one block: `env { A \"1\"; B \"2\" }`"
+            );
+        });
+    }
+
+    /// A malformed node of an earlier `REPEATABLE` kind must not
+    /// silence the note for a later kind: the block-child loop's early
+    /// exit used to `return` out of the whole function, walking away
+    /// from every kind after the malformed one rather than just
+    /// skipping the one it could not render.
+    #[test]
+    fn a_malformed_earlier_kind_does_not_silence_a_later_kind() {
+        with(&host(), |ctx| {
+            let alone = lint(ctx, &["path-share \"/a\"\npath-share \"/b\""]);
+            assert!(
+                ids(&alone).contains(&"repeat-outside-block"),
+                "{:?}",
+                alone.findings
+            );
+            // `home-share mode=ro` has no positional argument, so
+            // `as_block_child` cannot render it — `home-share` comes
+            // before `path-share` in `REPEATABLE`.
+            let with_a_malformed_earlier_kind = lint(
+                ctx,
+                &["home-share mode=ro\nhome-share \".b\" mode=ro\n\
+                   path-share \"/a\"\npath-share \"/b\""],
+            );
+            let f = with_a_malformed_earlier_kind
+                .findings
+                .iter()
+                .find(|f| f.id == "repeat-outside-block")
+                .expect("the note still fires for path-share");
+            assert!(f.message.starts_with("`path-share`"), "{f:?}");
+        });
+    }
+
+    /// No shipped profile writes a repeatable kind twice on its own
+    /// line: the block is the form the manual teaches, and a profile is
+    /// where a reader learns it.
+    #[test]
+    fn no_shipped_profile_repeats_a_line_form_node() {
+        let e = env();
+        let resolver = crate::profile::Resolver::new(&e);
+        with(&host(), |ctx| {
+            for entry in resolver.list().unwrap() {
+                let report = lint_profile(ctx, &resolver, &entry.name).unwrap();
+                assert!(
+                    !report
+                        .findings
+                        .iter()
+                        .any(|f| f.id == "repeat-outside-block"),
+                    "{}: {:?}",
+                    entry.name,
+                    report.findings
+                );
+            }
+        });
+    }
+}

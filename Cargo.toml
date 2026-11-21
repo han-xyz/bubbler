@@ -2,6 +2,9 @@
 resolver = "3"
 members = [
     "crates/bubbler-core",
+    "crates/bubbler-model",
+    "crates/bubbler-plan",
+    "crates/bubbler-run",
     "crates/bubbler",
     "crates/bubbler-init",
     "crates/bubbler-wl-proxy",
@@ -27,6 +30,9 @@ repository = "https://github.com/han-xyz/bubbler"
 # `cargo deny` reads one as a wildcard requirement.  Bumped with
 # `workspace.package.version` at each release.
 bubbler-core = { path = "crates/bubbler-core", version = "0.26.4" }
+bubbler-model = { path = "crates/bubbler-model", version = "0.26.4" }
+bubbler-plan = { path = "crates/bubbler-plan", version = "0.26.4" }
+bubbler-run = { path = "crates/bubbler-run", version = "0.26.4" }
 bubbler-init = { path = "crates/bubbler-init", version = "0.26.4" }
 bubbler-net-proxy = { path = "crates/bubbler-net-proxy", version = "0.26.4" }
 kdl = "6"

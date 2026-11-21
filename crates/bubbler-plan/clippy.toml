@@ -1,0 +1,9 @@
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "run layer only" },
+    { path = "std::fs::write", reason = "run layer only" },
+    { path = "std::fs::remove_file", reason = "run layer only" },
+    { path = "std::fs::remove_dir_all", reason = "run layer only" },
+    { path = "std::fs::create_dir", reason = "run layer only" },
+    { path = "std::fs::create_dir_all", reason = "run layer only" },
+    { path = "std::fs::rename", reason = "run layer only" },
+]

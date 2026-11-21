@@ -8,28 +8,12 @@ repository.workspace = true
 description = "Library core of bubbler: config model, services, bwrap argument builder, launcher"
 
 [dependencies]
-bubbler-init.workspace = true
-# The `HostPattern` rule an `allow-host` is parsed by is the same one
-# the egress proxy holds a `CONNECT` target to; core takes it from the
-# proxy's library rather than keeping a second copy of a filter rule.
-bubbler-net-proxy.workspace = true
-kdl.workspace = true
-thiserror.workspace = true
-# `stdio` for the last-run log, which points fd 2 at a file for a run
-# nobody is watching a terminal for.
-rustix = { workspace = true, features = ["stdio"] }
-signal-hook.workspace = true
-libseccomp.workspace = true
-# Wayland client in pure Rust, no libwayland: the security-context
-# handshake is six requests, but the wire format with its fd passing is
-# not worth hand-rolling.
-wayrs-client.workspace = true
-wayrs-protocols.workspace = true
-unicode-width.workspace = true
-libc.workspace = true
-serde_json.workspace = true
+bubbler-model.workspace = true
+bubbler-plan.workspace = true
+bubbler-run.workspace = true
 
 [dev-dependencies]
+rustix.workspace = true
 tempfile.workspace = true
 # Property tests over generated configs and include graphs: hand-rolled
 # generators would be a worse shrinker than proptest's.

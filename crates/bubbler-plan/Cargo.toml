@@ -1,0 +1,30 @@
+[package]
+name = "bubbler-plan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Plan layer of bubbler: services, the bwrap argument builder, explain and lint"
+
+[features]
+# Test helpers (`host::fake`, `sidecar_argv::test_support`,
+# `desktop::test_support`) for the run crate's tests; never enabled in a
+# normal build.
+test-support = ["dep:tempfile"]
+
+[dependencies]
+bubbler-model.workspace = true
+kdl.workspace = true
+thiserror.workspace = true
+rustix.workspace = true
+libseccomp.workspace = true
+unicode-width.workspace = true
+serde_json.workspace = true
+# `host::fake` makes its real file types in a temp dir.
+tempfile = { workspace = true, optional = true }
+
+[dev-dependencies]
+bubbler-model = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true

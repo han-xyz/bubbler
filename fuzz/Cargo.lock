@@ -24,18 +24,9 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 name = "bubbler-core"
 version = "0.26.4"
 dependencies = [
- "bubbler-init",
- "bubbler-net-proxy",
- "kdl",
- "libc",
- "libseccomp",
- "rustix",
- "serde_json",
- "signal-hook",
- "thiserror",
- "unicode-width 0.2.2",
- "wayrs-client",
- "wayrs-protocols",
+ "bubbler-model",
+ "bubbler-plan",
+ "bubbler-run",
 ]
 
 [[package]]
@@ -58,11 +49,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "bubbler-model"
+version = "0.26.4"
+dependencies = [
+ "bubbler-net-proxy",
+ "kdl",
+ "libseccomp",
+ "rustix",
+ "thiserror",
+ "unicode-width 0.2.2",
+]
+
+[[package]]
 name = "bubbler-net-proxy"
 version = "0.26.4"
 dependencies = [
  "rustix",
  "thiserror",
+]
+
+[[package]]
+name = "bubbler-plan"
+version = "0.26.4"
+dependencies = [
+ "bubbler-model",
+ "kdl",
+ "libseccomp",
+ "rustix",
+ "serde_json",
+ "thiserror",
+ "unicode-width 0.2.2",
+]
+
+[[package]]
+name = "bubbler-run"
+version = "0.26.4"
+dependencies = [
+ "bubbler-init",
+ "bubbler-model",
+ "bubbler-plan",
+ "libc",
+ "rustix",
+ "signal-hook",
+ "thiserror",
+ "wayrs-client",
+ "wayrs-protocols",
 ]
 
 [[package]]
