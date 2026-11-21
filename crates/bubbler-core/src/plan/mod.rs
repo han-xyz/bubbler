@@ -11,4 +11,5 @@ pub mod network;
 pub mod pipewire;
 pub mod seccomp;
 pub mod service;
+pub mod version;
 pub mod wayland;

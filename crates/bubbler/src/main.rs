@@ -37,7 +37,7 @@ use bubbler_core::profile_ops;
 use bubbler_core::run_log;
 use bubbler_core::safe_text;
 use bubbler_core::tty::{self, TtyMode};
-use bubbler_core::version;
+use bubbler_core::version_probe;
 use bubbler_core::wrap;
 use bubbler_core::wrap_ops;
 use clap::builder::{OsStringValueParser, TypedValueParser};
@@ -779,7 +779,7 @@ fn explain(
         seccomp_log: env.seccomp_log,
         proxy: opts.proxy || opts.wl_proxy || opts.net_proxy,
         full: opts.mode == Explain::Full,
-        bwrap: version::bwrap(),
+        bwrap: version_probe::bwrap(),
     };
     let rendered = match opts.format {
         Format::Text => explain::render(&items, &view),

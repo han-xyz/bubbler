@@ -11,5 +11,5 @@ pub mod proc;
 pub mod profile_ops;
 pub mod run_log;
 pub mod tty;
-pub mod version;
+pub mod version_probe;
 pub mod wrap_ops;

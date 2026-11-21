@@ -51,7 +51,7 @@ use crate::tty::{self, Pty, RawGuard, RelayEnd, StdioTarget, TtyMode};
 use crate::wayland::{ProxyPlan, WaylandError};
 use crate::{
     cgroup, dbus, exec, init_bin, network, pipewire, proc, run_log, seccomp, service, version,
-    wayland,
+    version_probe, wayland,
 };
 
 const POLL: Duration = Duration::from_millis(100);
@@ -2951,7 +2951,11 @@ fn start_run(
 ) -> Result<i32, LaunchError> {
     // Before anything is created: a tool below its floor is reported even if the run then fails
     // for another reason.
-    for line in version::warnings(version::bwrap(), version::proxy(env), &inst.config.services) {
+    for line in version::warnings(
+        version_probe::bwrap(),
+        version_probe::proxy(env),
+        &inst.config.services,
+    ) {
         eprintln!("bubbler: warning: {line}");
     }
     prepare_runtime_dir(env, inst)?;
