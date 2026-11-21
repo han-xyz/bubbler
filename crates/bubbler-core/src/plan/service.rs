@@ -1449,7 +1449,7 @@ mod tests {
         apply_all(services, env, &mut args, &host, &ctx)?;
         Ok(strs(&args.finish(
             &[OsString::from("x")],
-            &mut crate::launcher::DryRunAlloc::new(PathBuf::from("/run/user/1000/bubbler/i")),
+            &mut crate::sidecar_argv::DryRunAlloc::new(PathBuf::from("/run/user/1000/bubbler/i")),
         )?))
     }
 
@@ -1477,7 +1477,7 @@ mod tests {
         apply_shares(services, shares, &env, &mut args, &host)?;
         Ok(strs(&args.finish(
             &[OsString::from("x")],
-            &mut crate::launcher::DryRunAlloc::new(PathBuf::from("/run/user/1000/bubbler/i")),
+            &mut crate::sidecar_argv::DryRunAlloc::new(PathBuf::from("/run/user/1000/bubbler/i")),
         )?))
     }
 
@@ -4266,7 +4266,7 @@ mod tests {
             &args
                 .finish(
                     &[OsString::from("x")],
-                    &mut crate::launcher::DryRunAlloc::new(PathBuf::from(
+                    &mut crate::sidecar_argv::DryRunAlloc::new(PathBuf::from(
                         "/run/user/1000/bubbler/i",
                     )),
                 )

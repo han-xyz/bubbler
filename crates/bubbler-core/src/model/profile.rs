@@ -3115,7 +3115,7 @@ pub(crate) mod tests {
             let items = args
                 .finish_explained(
                     &[OsString::from("x")],
-                    &mut crate::launcher::DryRunAlloc::new(PathBuf::from(
+                    &mut crate::sidecar_argv::DryRunAlloc::new(PathBuf::from(
                         "/run/user/1000/bubbler/i",
                     )),
                 )

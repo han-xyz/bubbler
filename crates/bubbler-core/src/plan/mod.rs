@@ -14,6 +14,7 @@ pub mod pipewire;
 pub mod plan_error;
 pub mod seccomp;
 pub mod service;
+pub mod sidecar_argv;
 pub mod tty;
 pub mod version;
 pub mod wayland;

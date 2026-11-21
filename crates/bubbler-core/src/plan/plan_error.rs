@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use libseccomp::error::SeccompError;
 use thiserror::Error;
 
+use crate::model::error::ConfigError;
+
 /// Failures while resolving what a run binds, sets and filters.
 #[derive(Debug, Error)]
 pub enum PlanError {
@@ -100,6 +102,9 @@ pub enum PlanError {
     /// The compiled program could not be read back through its memfd.
     #[error("compiling the seccomp filter: exporting the filter: {0}")]
     SeccompExport(io::Error),
+    /// The instance has no command to run.
+    #[error(transparent)]
+    Config(#[from] ConfigError),
 }
 
 #[cfg(test)]

@@ -39,6 +39,7 @@ pub use plan::network;
 pub use plan::pipewire;
 pub use plan::seccomp;
 pub use plan::service;
+pub use plan::sidecar_argv;
 pub use plan::tty;
 pub use plan::version;
 pub use plan::wayland;
