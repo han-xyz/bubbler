@@ -6,4 +6,12 @@ disallowed-methods = [
     { path = "std::fs::create_dir", reason = "run layer only" },
     { path = "std::fs::create_dir_all", reason = "run layer only" },
     { path = "std::fs::rename", reason = "run layer only" },
+    { path = "std::fs::File::create", reason = "run layer only" },
+    { path = "std::fs::OpenOptions::open", reason = "run layer only" },
+    { path = "std::os::unix::fs::symlink", reason = "run layer only" },
+    { path = "std::os::unix::net::UnixListener::bind", reason = "run layer only" },
+    { path = "std::os::unix::net::UnixStream::connect", reason = "run layer only" },
+    { path = "std::fs::set_permissions", reason = "run layer only" },
+    { path = "std::fs::copy", reason = "run layer only" },
+    { path = "std::fs::hard_link", reason = "run layer only" },
 ]
