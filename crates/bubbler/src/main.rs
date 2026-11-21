@@ -15,6 +15,7 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 use bubbler_core::audio_policy;
+use bubbler_core::audio_policy_ask;
 use bubbler_core::cgroup;
 use bubbler_core::config::{self, Service, Share, ShareMode, X11Mode};
 use bubbler_core::dbus;
@@ -755,8 +756,12 @@ fn explain(
     }
     let rules = explain::rules(&inst.config, &inst.name);
     let wl_proxy = launcher::wl_proxy_plan(env, inst);
-    let audio_suffix =
-        audio_policy::explain_suffix(&inst.config, &RealHost, env, audio_policy::loaded_revision);
+    let audio_suffix = audio_policy::explain_suffix(
+        &inst.config,
+        &RealHost,
+        env,
+        audio_policy_ask::loaded_revision,
+    );
     let own_cgroup = cgroup::own_path().ok();
     let view = explain::View {
         title,
@@ -1180,7 +1185,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
     }
     let env = host_env::from_process()?;
     // One answer per invocation: `profile lint --all` would otherwise ask once per audio profile.
-    let asked = audio_policy::AskedOnce::default();
+    let asked = audio_policy_ask::AskedOnce::default();
     let loaded_revision = |env: &Env| asked.get(env);
     match cli.cmd {
         Cmd::Create { name, profile } => {

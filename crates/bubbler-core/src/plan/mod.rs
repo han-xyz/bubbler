@@ -1,3 +1,4 @@
+pub mod audio_policy;
 pub mod bwrap;
 pub mod cgroup_text;
 pub mod dbus;

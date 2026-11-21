@@ -4,7 +4,7 @@
 //! holds cannot fail to parse, which is why there is no syntax error to
 //! recover from anywhere below.
 
-use bubbler_core::audio_policy::AskedOnce;
+use bubbler_core::audio_policy_ask::AskedOnce;
 use bubbler_core::catalogue::{self, Grant};
 use bubbler_core::config::{
     self, Disabled, EtcMode, InstanceConfig, Node, Portal, RawProfile, Service, Userns,

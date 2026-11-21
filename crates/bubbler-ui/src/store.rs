@@ -3,7 +3,7 @@
 //! liveness probe on every tick.
 
 use anyhow::{Context, Result};
-use bubbler_core::audio_policy::AskedOnce;
+use bubbler_core::audio_policy_ask::AskedOnce;
 use bubbler_core::env::Env;
 use bubbler_core::host::RealHost;
 use bubbler_core::instance::{self, Instance};

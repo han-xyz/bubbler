@@ -4838,7 +4838,7 @@ fn no_context_sees_or_makes_the_policys_metadata() {
             "a {grant} context made a second one: {made:?}"
         );
         assert_eq!(
-            audio_policy::loaded_revision_asking(
+            audio_policy_ask::loaded_revision_asking(
                 Path::new(audio_policy::PW_DUMP),
                 &bed.dir().join("run")
             ),

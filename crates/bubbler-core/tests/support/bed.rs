@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use rustix::process::{Pid, Signal, kill_process, set_parent_process_death_signal};
 
 use bubbler_core::audio_policy::{self, LoadedRevision};
+use bubbler_core::audio_policy_ask;
 
 /// The policy drop-in as it is shipped, loaded by the bed's WirePlumber
 /// from the bed's own config directory. The tests below are what says
@@ -507,7 +508,10 @@ fn publishes_a_revision(dump: &str) -> bool {
 
 /// What the bed's WirePlumber answers, asked once.
 pub fn loaded_revision(bed: &PipeWireBed) -> LoadedRevision {
-    audio_policy::loaded_revision_asking(Path::new(audio_policy::PW_DUMP), &bed.dir().join("run"))
+    audio_policy_ask::loaded_revision_asking(
+        Path::new(audio_policy::PW_DUMP),
+        &bed.dir().join("run"),
+    )
 }
 
 /// A bed whose hook is the shipped one with `from` replaced by `to`.
