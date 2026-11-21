@@ -27,6 +27,7 @@ use bubbler_core::explain;
 use bubbler_core::forward;
 use bubbler_core::host::RealHost;
 use bubbler_core::instance::{self, Instance};
+use bubbler_core::instance_ops;
 use bubbler_core::launcher;
 use bubbler_core::lint;
 use bubbler_core::profile;
@@ -1180,7 +1181,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
     let loaded_revision = |env: &Env| asked.get(env);
     match cli.cmd {
         Cmd::Create { name, profile } => {
-            let inst = Instance::create(&env, &name, &profile)
+            let inst = instance_ops::create(&env, &name, &profile)
                 .with_context(|| format!("creating instance `{name}`"))?;
             let path = host_env::search_path();
             let ctx = lint::Context {
@@ -1367,7 +1368,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             command,
         } => {
             let grants: Vec<&str> = grants.iter().map(String::as_str).collect();
-            let mut eph = Instance::ephemeral(&env, &profile, &grants)
+            let mut eph = instance_ops::ephemeral(&env, &profile, &grants)
                 .context("creating a throwaway sandbox")?;
             // Before the argument forwarding below and the explanation
             // after it, both of which describe the sandbox this run asks
@@ -1615,7 +1616,8 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             if !yes {
                 bail!("refusing to delete `{name}` without --yes (this removes its private home)");
             }
-            Instance::delete(&env, &name).with_context(|| format!("deleting instance `{name}`"))?;
+            instance_ops::delete(&env, &name)
+                .with_context(|| format!("deleting instance `{name}`"))?;
             // Named, not removed: a shim is a file on the user's `PATH`,
             // and `delete` taking one away is a surprise `unwrap` is for.
             match wrap::load(&env) {
@@ -1651,7 +1653,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // grants mean what this bubbler says they mean, so the
             // version header goes in and the warning above is the last.
             if code == 0 {
-                Instance::mark_version(&env, &name)
+                instance_ops::mark_version(&env, &name)
                     .with_context(|| format!("recording the config version of `{name}`"))?;
             }
             // A config edited by hand is the likeliest place for an `x11`
@@ -1739,7 +1741,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             }
         },
         Cmd::Reseed { name } => {
-            let inst = Instance::reseed(&env, &name)
+            let inst = instance_ops::reseed(&env, &name)
                 .with_context(|| format!("reseeding instance `{name}`"))?;
             let config = inst.config_path();
             let path = host_env::search_path();

@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use bubbler_core::env::{DEFAULT_DATA_DIRS, Env};
-use bubbler_core::instance::Instance;
+use bubbler_core::instance_ops;
 use tempfile::TempDir;
 
 /// An [`Env`] whose store, profile layer and runtime directory are all
@@ -52,7 +52,7 @@ pub fn store(instances: &[(&str, &str)]) -> (TempDir, Env) {
     let env = env(tmp.path());
     std::fs::create_dir_all(&env.home).expect("a home");
     for (name, profile) in instances {
-        Instance::create(&env, name, profile).expect("a seeded instance");
+        instance_ops::create(&env, name, profile).expect("a seeded instance");
     }
     (tmp, env)
 }

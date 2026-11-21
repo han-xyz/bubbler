@@ -5,7 +5,7 @@ pub mod desktop;
 pub mod exec;
 pub mod forward;
 pub mod fsutil;
-pub mod instance;
+pub mod instance_ops;
 pub mod launcher;
 pub mod proc;
 pub mod run_log;

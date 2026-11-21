@@ -8,7 +8,7 @@
 //! The one block written back is `portals`, whose children *are* in the
 //! parsed value; a `camera` child comes back as its own top-level node,
 //! since that is the grant it parses to. Every caller of [`render`]
-//! rewrites the file wholesale already — `Instance::save`, `seed`,
+//! rewrites the file wholesale already — `instance_ops::save`, `seed`,
 //! `reseed` — so this loses nothing they kept.
 
 use std::ffi::{OsStr, OsString};

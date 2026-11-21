@@ -438,7 +438,7 @@ pub static GRANTS: &[Grant] = &[
     },
 ];
 
-/// Service names `Instance::ephemeral` accepts as grants: the bare
+/// Service names `instance_ops::ephemeral` accepts as grants: the bare
 /// config nodes, which take no arguments. Anything else needs a config
 /// file and therefore a real instance.
 pub const BARE_GRANTS: &[&str] = &[

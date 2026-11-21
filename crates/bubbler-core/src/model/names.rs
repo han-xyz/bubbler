@@ -14,7 +14,7 @@ pub const PROXY_BIN: &str = "xdg-dbus-proxy";
 /// looked up on `PATH`. Arch ships it in `passt`.
 pub const PASTA_BIN: &str = "pasta";
 
-// Whether `name` is the shape [`Instance::ephemeral`] gives a throwaway
+// Whether `name` is the shape `instance_ops::ephemeral` gives a throwaway
 // sandbox, `try-<pid>`, whose runtime directory is swept once that pid is
 // gone. An instance of that name would have its own swept out from under it.
 pub(crate) fn is_try_name(name: &str) -> bool {

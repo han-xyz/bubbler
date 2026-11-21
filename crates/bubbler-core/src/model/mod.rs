@@ -3,6 +3,7 @@ pub mod checks;
 pub mod config;
 pub mod env;
 pub mod error;
+pub mod instance;
 pub mod json;
 pub mod kdl_out;
 pub mod names;

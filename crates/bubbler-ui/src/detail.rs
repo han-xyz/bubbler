@@ -1,6 +1,6 @@
 //! One instance's config as the editor holds it: a typed
 //! [`InstanceConfig`] that is rendered to KDL for the linter and written
-//! back by [`Instance::save`], never a text buffer. A config the editor
+//! back by [`instance_ops::save`], never a text buffer. A config the editor
 //! holds cannot fail to parse, which is why there is no syntax error to
 //! recover from anywhere below.
 
@@ -12,6 +12,7 @@ use bubbler_core::config::{
 use bubbler_core::env::Env;
 use bubbler_core::host::RealHost;
 use bubbler_core::instance::{self, Instance};
+use bubbler_core::instance_ops;
 use bubbler_core::kdl_out;
 use bubbler_core::lint::{self, Finding, Where};
 use bubbler_core::seccomp::SeccompConfig;
@@ -624,11 +625,11 @@ impl Detail {
         }
     }
 
-    /// Write the buffer to `config.kdl` through [`Instance::save`], which
+    /// Write the buffer to `config.kdl` through [`instance_ops::save`], which
     /// keeps the headers, backs the old file up and re-parses what it
     /// wrote before replacing anything.
     pub fn save(&mut self, env: &Env) -> Result<String, String> {
-        self.inst.save(&self.buf).map_err(|e| e.to_string())?;
+        instance_ops::save(&self.inst, &self.buf).map_err(|e| e.to_string())?;
         self.saved = self.buf.clone();
         self.refresh(env);
         let mut said = format!(

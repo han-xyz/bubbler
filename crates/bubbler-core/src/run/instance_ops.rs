@@ -1,5 +1,6 @@
-//! Named instances: a directory with `config.kdl` and a private `home/`.
-//! Layout: `$XDG_DATA_HOME/bubbler/instances/<name>/`.
+//! Writes to the instance directories: creating, seeding, saving,
+//! reseeding and deleting an instance, and the throwaway instances of
+//! `bubbler try`.
 
 use std::fs;
 use std::io;
@@ -8,86 +9,26 @@ use std::path::{Path, PathBuf};
 use rustix::fs::Mode;
 use rustix::process::Pid;
 
-use crate::config::{self, InstanceConfig, NetworkConfig, Portal, Service, WaylandMode, X11Mode};
+use crate::config::{self, InstanceConfig};
 use crate::env::Env;
-use crate::error::{InstanceError, ReadError};
+use crate::error::InstanceError;
 use crate::fsutil;
+use crate::instance::{
+    CONFIG_FILE, CONFIG_HEADER, CONFIG_VERSION, Instance, app_id_twin, app_id_warning_in,
+    config_path_checked, config_version, instances_root, io_err, profile_header, read_config,
+    with_grants,
+};
 use crate::kdl_out;
+use crate::names::validate_name;
 use crate::profile::{self, PROFILE_HEADER};
 use crate::{dbus, exec, launcher, proc};
-
-pub use crate::catalogue::BARE_GRANTS as GRANTS;
-pub use crate::checks::APP_ID_SHARED_CHECK;
-pub use crate::names::is_plain_name;
-use crate::names::validate_name;
-
-const CONFIG_FILE: &str = "config.kdl";
-
-/// Header line recording which meanings a `config.kdl` was written
-/// against. Second line of a seeded file, after the profile header.
-pub(crate) const CONFIG_HEADER: &str = "// bubbler config: ";
-
-/// The meanings this bubbler writes. Version 3 is where a bare `portals`
-/// node stopped carrying the privileged portal interfaces; version 2 is
-/// where a bare `network` node became the sandbox's own network
-/// namespace; version 1 is every file written before that, which has no
-/// header at all.
-pub const CONFIG_VERSION: u32 = 3;
-
-// Each migration is measured against the version that introduced it,
-// not against [`CONFIG_VERSION`]: a file that has been through one has
-// been through it whatever came after.
-const ISOLATED_NETWORK_VERSION: u32 = 2;
-
-const PORTAL_CHILDREN_VERSION: u32 = 3;
 
 // Where `reseed` keeps the `config.kdl` it replaces.
 const BACKUP_FILE: &str = "config.kdl.bak";
 
-/// Directory holding all instances.
-pub fn instances_root(env: &Env) -> PathBuf {
-    env.data_home.join("bubbler").join("instances")
-}
-
 // Directory holding throwaway instances, one per bubbler pid.
 fn try_root(env: &Env) -> PathBuf {
     env.data_home.join("bubbler").join("try")
-}
-
-/// Where `name`'s configuration would live, without opening the instance,
-/// so a caller can name the file in an error message.
-pub fn config_path(env: &Env, name: &str) -> PathBuf {
-    instances_root(env).join(name).join(CONFIG_FILE)
-}
-
-/// Where `name`'s configuration lives, checked to be an existing regular
-/// file but not parsed, so a broken config can still be opened by an editor.
-pub fn config_path_checked(env: &Env, name: &str) -> Result<PathBuf, InstanceError> {
-    validate_name(name)?;
-    let path = config_path(env, name);
-    match fs::metadata(&path) {
-        Ok(m) if m.is_file() => Ok(path),
-        Ok(_) => Err(InstanceError::NotFound(name.to_owned())),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            Err(InstanceError::NotFound(name.to_owned()))
-        }
-        Err(e) => Err(InstanceError::Io(path, e)),
-    }
-}
-
-/// A created instance with its parsed configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Instance {
-    /// Validated name: `[A-Za-z0-9._-]+`, not starting with `-`, and not
-    /// `.` or `..`.
-    pub name: String,
-    /// `<instances_root>/<name>`.
-    pub dir: PathBuf,
-    /// Parsed `config.kdl`.
-    pub config: InstanceConfig,
-    /// Version its header records, or `None` for a file written before
-    /// there was one. [`Instance::migration_warning`] is what reads it.
-    pub config_version: Option<u32>,
 }
 
 // Bytes a `sockaddr_un` holds, the terminating NUL among them
@@ -117,55 +58,6 @@ fn check_socket_paths(env: &Env, name: &str) -> Result<(), InstanceError> {
     Ok(())
 }
 
-/// The existing instance, other than `name` itself, whose portal app id is
-/// `name`'s.
-pub fn app_id_twin(env: &Env, name: &str) -> Result<Option<String>, InstanceError> {
-    let names = list_in(&instances_root(env))?;
-    Ok(dbus::app_id_twin(name, &names).map(str::to_owned))
-}
-
-// The warning `name`'s run, or its keeping, prints when another instance
-// in `root` shares its app id and `config` does not accept that.
-fn app_id_warning_in(
-    root: &Path,
-    name: &str,
-    config: &InstanceConfig,
-) -> Result<Option<String>, InstanceError> {
-    if config.accepts(APP_ID_SHARED_CHECK) {
-        return Ok(None);
-    }
-    let names = list_in(root)?;
-    Ok(dbus::app_id_twin(name, &names).map(|other| {
-        format!(
-            "instance `{name}` shares the portal app id `{}` with instance `{other}`, and with \
-             it portal permissions, forwarded documents and the window app id; rename one \
-             of the two, or accept it with `lint-allow \"{APP_ID_SHARED_CHECK}\"`",
-            dbus::app_id(name),
-        )
-    }))
-}
-
-// Names of the instances under `root`, sorted. An absent root holds none.
-fn list_in(root: &Path) -> Result<Vec<String>, InstanceError> {
-    let entries = match fs::read_dir(root) {
-        Ok(e) => e,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(InstanceError::Io(root.to_path_buf(), e)),
-    };
-    let mut names = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(io_err(root))?;
-        if let Some(n) = entry.file_name().to_str()
-            && validate_name(n).is_ok()
-            && entry.path().join(CONFIG_FILE).is_file()
-        {
-            names.push(n.to_owned());
-        }
-    }
-    names.sort();
-    Ok(names)
-}
-
 fn refuse_app_id_twin(env: &Env, name: &str) -> Result<(), InstanceError> {
     match app_id_twin(env, name)? {
         Some(other) => Err(InstanceError::AppIdShared {
@@ -175,20 +67,6 @@ fn refuse_app_id_twin(env: &Env, name: &str) -> Result<(), InstanceError> {
         }),
         None => Ok(()),
     }
-}
-
-fn io_err(path: &Path) -> impl FnOnce(io::Error) -> InstanceError + '_ {
-    move |e| InstanceError::Io(path.to_path_buf(), e)
-}
-
-// One `config.kdl`, refused on its size before it is read. A file past
-// the parser's bound is the [`crate::error::ConfigError`] the parser
-// gives; anything else names the path, the way [`io_err`] does.
-fn read_config(path: &Path) -> Result<String, InstanceError> {
-    config::read_bounded(path).map_err(|e| match e {
-        ReadError::Io(e) => InstanceError::Io(path.to_path_buf(), e),
-        ReadError::TooLarge(e) => InstanceError::Config(e),
-    })
 }
 
 // [`fsutil::write_atomic`] as an [`InstanceError`]: a config is
@@ -212,119 +90,6 @@ fn make_dir(dir: &Path, name: &str, text: &str) -> Result<(), InstanceError> {
     rustix::fs::mkdir(&home, Mode::RWXU).map_err(|e| InstanceError::Io(home.clone(), e.into()))?;
     let cfg_path = dir.join(CONFIG_FILE);
     fs::write(&cfg_path, text).map_err(io_err(&cfg_path))
-}
-
-fn grant_service(name: &str) -> Option<Service> {
-    Some(match name {
-        // Always the security context: `--grant wayland` is not where a
-        // user asks for the session's own socket.
-        "wayland" => Service::Wayland(WaylandMode::default()),
-        // The sandbox's own server: `--grant x11` is not where a user
-        // asks for the session's display, and it needs `--grant wayland
-        // --grant dri` with it, which the config check names.
-        "x11" => Service::X11(X11Mode::default()),
-        "network" => Service::Network(NetworkConfig::default()),
-        "dri" => Service::Dri { kms: false },
-        "pipewire" => Service::Pipewire {
-            microphone: false,
-            devices: false,
-            exclusive: false,
-            capturable: false,
-        },
-        "pulseaudio" => Service::Pulseaudio {
-            microphone: false,
-            exclusive: false,
-            capturable: false,
-        },
-        "dbus" => Service::Dbus { rules: Vec::new() },
-        "portals" => Service::Portals {
-            children: Vec::new(),
-        },
-        // A child is written as the node that carries it: `--grant
-        // screencast` on a config that already has `portals` adds the
-        // child to it, which `with_grants` does below.
-        name if Portal::from_name(name).is_some() => Service::Portals {
-            children: vec![Portal::from_name(name).expect("just matched")],
-        },
-        "notify" => Service::Notify,
-        "tray" => Service::Tray,
-        "a11y" => Service::A11y,
-        "input-method" => Service::InputMethod,
-        "gamepad" => Service::Gamepad {
-            hidraw: false,
-            uinput: false,
-        },
-        "hidraw" => Service::Hidraw,
-        "camera" => Service::Camera { nodes: false },
-        _ => return None,
-    })
-}
-
-// Add one bare service node per grant. A grant the config already holds
-// is skipped: the parser rejects a duplicate.
-fn with_grants(cfg: &mut InstanceConfig, grants: &[&str]) -> Result<(), InstanceError> {
-    for g in grants {
-        let svc = grant_service(g).ok_or_else(|| InstanceError::InvalidGrant((*g).to_owned()))?;
-        // Two `dbus` nodes hold different rules, so that grant is
-        // recognised by its variant rather than by value.
-        let held = match &svc {
-            Service::Dbus { .. } => cfg
-                .services
-                .iter()
-                .any(|s| matches!(s, Service::Dbus { .. })),
-            // A `gamepad` already in the config may carry properties this
-            // bare grant does not, and the parser takes one node only.
-            Service::Gamepad { .. } => cfg
-                .services
-                .iter()
-                .any(|s| matches!(s, Service::Gamepad { .. })),
-            // Same for `camera`, whose `nodes` property a config may
-            // already carry.
-            Service::Camera { .. } => cfg
-                .services
-                .iter()
-                .any(|s| matches!(s, Service::Camera { .. })),
-            // The same for `network`, whose mode and children the bare
-            // grant does not carry.
-            Service::Network { .. } => cfg
-                .services
-                .iter()
-                .any(|s| matches!(s, Service::Network { .. })),
-            // And for the two display grants, whose mode the bare grant
-            // does not carry either: `--grant x11` on a profile holding
-            // `x11 "host"` would otherwise write a second node the
-            // parser refuses.
-            Service::Wayland(_) => cfg
-                .services
-                .iter()
-                .any(|s| matches!(s, Service::Wayland(_))),
-            Service::X11(_) => cfg.services.iter().any(|s| matches!(s, Service::X11(_))),
-            // The one grant that merges into a node already held: a
-            // second `portals` node is a duplicate, so a child has to
-            // join the first rather than fail the "one node" check above.
-            Service::Portals { children } => {
-                match cfg.services.iter_mut().find_map(|s| match s {
-                    Service::Portals { children } => Some(children),
-                    _ => None,
-                }) {
-                    Some(held) => {
-                        for c in children {
-                            if !held.contains(c) {
-                                held.push(*c);
-                            }
-                        }
-                        true
-                    }
-                    None => false,
-                }
-            }
-            other => cfg.services.contains(other),
-        };
-        if !held {
-            cfg.services.push(svc);
-        }
-    }
-    Ok(())
 }
 
 // What a `config.kdl` holds when its profile grants nothing: the same
@@ -360,31 +125,6 @@ fn seed(
     let text = format!("{PROFILE_HEADER}{profile_name}\n{CONFIG_HEADER}{CONFIG_VERSION}\n{body}");
     let config = config::parse(&text)?;
     Ok((text, config))
-}
-
-/// The profile name the first line records, if that line is the header a
-/// seeded config carries and what follows it is a profile name. A config
-/// written by hand without it names no profile to re-flatten.
-pub fn profile_header(text: &str) -> Option<&str> {
-    let name = text
-        .lines()
-        .next()?
-        .strip_prefix(PROFILE_HEADER)?
-        .trim_end();
-    is_plain_name(name).then_some(name)
-}
-
-// The version the header records, if the file has one. Only the leading
-// comment block is read: a `// bubbler config:` line further down is
-// part of somebody's notes, not a header.
-fn config_version(text: &str) -> Option<u32> {
-    text.lines()
-        .take_while(|l| {
-            let l = l.trim_start();
-            l.is_empty() || l.starts_with("//")
-        })
-        .find_map(|l| l.trim_start().strip_prefix(CONFIG_HEADER))
-        .and_then(|v| v.trim().parse().ok())
 }
 
 // The pid a sweepable directory is named after: decimal digits only, so
@@ -521,271 +261,180 @@ impl Drop for Ephemeral {
     }
 }
 
-impl Instance {
-    /// The line a real run prints when another instance shares this one's
-    /// portal app id, unless the config accepts it with a `lint-allow`.
-    pub fn app_id_warning(&self, env: &Env) -> Result<Option<String>, InstanceError> {
-        app_id_warning_in(&instances_root(env), &self.name, &self.config)
-    }
+/// Create a new instance seeded from a profile, flattened through its
+/// layers. Fails if the directory already exists; never overwrites.
+pub fn create(env: &Env, name: &str, profile_name: &str) -> Result<Instance, InstanceError> {
+    validate_name(name)?;
+    check_socket_paths(env, name)?;
+    refuse_app_id_twin(env, name)?;
+    let (text, config) = seed(env, profile_name, &[])?;
+    let dir = instances_root(env).join(name);
+    make_dir(&dir, name, &text)?;
+    Ok(Instance {
+        name: name.to_owned(),
+        dir,
+        config,
+        config_version: Some(CONFIG_VERSION),
+    })
+}
 
-    /// Private home directory on the host, bound to `/home/bubbler` inside.
-    pub fn home(&self) -> PathBuf {
-        self.dir.join("home")
+/// Create a throwaway instance seeded from a flattened profile plus
+/// one bare node per grant, named `try-<pid>` so its runtime directory
+/// is its own. The guard removes it again when it drops.
+pub fn ephemeral(
+    env: &Env,
+    profile_name: &str,
+    grants: &[&str],
+) -> Result<Ephemeral, InstanceError> {
+    sweep_stale(env);
+    let (text, config) = seed(env, profile_name, grants)?;
+    let pid = std::process::id();
+    let name = format!("try-{pid}");
+    check_socket_paths(env, &name)?;
+    let dir = try_root(env).join(pid.to_string());
+    let runtime = launcher::instance_runtime_dir(env, &name);
+    // Only this process can be the live owner of try/<own pid>, so a
+    // directory there is a leftover from a bubbler whose pid was reused.
+    if let Err(e) = fs::remove_dir_all(&dir)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        return Err(InstanceError::Io(dir, e));
     }
-
-    /// Path of `config.kdl`.
-    pub fn config_path(&self) -> PathBuf {
-        self.dir.join(CONFIG_FILE)
-    }
-
-    /// Create a new instance seeded from a profile, flattened through its
-    /// layers. Fails if the directory already exists; never overwrites.
-    pub fn create(env: &Env, name: &str, profile_name: &str) -> Result<Self, InstanceError> {
-        validate_name(name)?;
-        check_socket_paths(env, name)?;
-        refuse_app_id_twin(env, name)?;
-        let (text, config) = seed(env, profile_name, &[])?;
-        let dir = instances_root(env).join(name);
-        make_dir(&dir, name, &text)?;
-        Ok(Self {
-            name: name.to_owned(),
+    make_dir(&dir, &name, &text)?;
+    let start_lock = launcher::start_lock_path(env, &name);
+    Ok(Ephemeral {
+        instance: Instance {
+            name,
             dir,
             config,
             config_version: Some(CONFIG_VERSION),
-        })
-    }
+        },
+        keep: None,
+        instances_root: instances_root(env),
+        start_lock,
+        runtime,
+        remove_runtime: true,
+    })
+}
 
-    /// Create a throwaway instance seeded from a flattened profile plus
-    /// one bare node per grant, named `try-<pid>` so its runtime directory
-    /// is its own. The guard removes it again when it drops.
-    pub fn ephemeral(
-        env: &Env,
-        profile_name: &str,
-        grants: &[&str],
-    ) -> Result<Ephemeral, InstanceError> {
-        sweep_stale(env);
-        let (text, config) = seed(env, profile_name, grants)?;
-        let pid = std::process::id();
-        let name = format!("try-{pid}");
-        check_socket_paths(env, &name)?;
-        let dir = try_root(env).join(pid.to_string());
-        let runtime = launcher::instance_runtime_dir(env, &name);
-        // Only this process can be the live owner of try/<own pid>, so a
-        // directory there is a leftover from a bubbler whose pid was reused.
-        if let Err(e) = fs::remove_dir_all(&dir)
-            && e.kind() != io::ErrorKind::NotFound
-        {
-            return Err(InstanceError::Io(dir, e));
+/// Remove the instance directory, including its private home, and its
+/// runtime directory. Refuses to follow a symlink in place of the
+/// instance directory.
+pub fn delete(env: &Env, name: &str) -> Result<(), InstanceError> {
+    validate_name(name)?;
+    let dir = instances_root(env).join(name);
+    let meta = match fs::symlink_metadata(&dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(InstanceError::NotFound(name.to_owned()));
         }
-        make_dir(&dir, &name, &text)?;
-        let start_lock = launcher::start_lock_path(env, &name);
-        Ok(Ephemeral {
-            instance: Self {
-                name,
-                dir,
-                config,
-                config_version: Some(CONFIG_VERSION),
-            },
-            keep: None,
-            instances_root: instances_root(env),
-            start_lock,
-            runtime,
-            remove_runtime: true,
-        })
+        Err(e) => return Err(InstanceError::Io(dir, e)),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(InstanceError::IsSymlink(dir));
     }
+    fs::remove_dir_all(&dir).map_err(io_err(&dir))?;
+    let run = env.runtime_dir.join(launcher::RUNTIME_SUBDIR).join(name);
+    match fs::remove_dir_all(&run) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(InstanceError::Io(run, e)),
+    }
+}
 
-    /// Open an existing instance and parse its config.
-    pub fn open(env: &Env, name: &str) -> Result<Self, InstanceError> {
-        validate_name(name)?;
-        let dir = instances_root(env).join(name);
-        let cfg_path = dir.join(CONFIG_FILE);
-        let text = match read_config(&cfg_path) {
-            Ok(t) => t,
-            Err(InstanceError::Io(_, e)) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(InstanceError::NotFound(name.to_owned()));
-            }
-            Err(e) => return Err(e),
-        };
-        let config = config::parse(&text)?;
-        Ok(Self {
-            name: name.to_owned(),
-            dir,
-            config,
-            config_version: config_version(&text),
-        })
+/// Write `config` back to `config.kdl`, keeping the headers the file
+/// carries: the profile it was seeded from, so `reseed` still knows
+/// where to re-flatten it from, and the config version. `config.kdl`
+/// and `config.kdl.bak` are written through [`fsutil::write_atomic`]:
+/// a symlink left under either name is replaced rather than written
+/// through.
+pub fn save(inst: &Instance, config: &InstanceConfig) -> Result<(), InstanceError> {
+    let cfg_path = inst.config_path();
+    let held = read_config(&cfg_path)?;
+    let mut text = String::new();
+    // A profile is only named where the file already named one: a
+    // header invented here would send `reseed` to somebody else's
+    // profile. The name passed the profile grammar to be read as a
+    // header at all, so it holds no newline of its own.
+    if let Some(profile_name) = profile_header(&held) {
+        text.push_str(&format!("{PROFILE_HEADER}{profile_name}\n"));
     }
+    text.push_str(&format!("{CONFIG_HEADER}{CONFIG_VERSION}\n"));
+    text.push_str(&kdl_out::render(config)?);
+    // Read back before anything is written, the way a seed is: a file
+    // the parser would refuse is an instance that cannot be opened
+    // again, and the checks across nodes (`camera` needs `portals`)
+    // are only made here.
+    config::parse(&text)?;
+    write_atomic(&inst.dir.join(BACKUP_FILE), &held)?;
+    write_atomic(&cfg_path, &text)
+}
 
-    /// Names of all instances, sorted. An absent root means no instances.
-    pub fn list(env: &Env) -> Result<Vec<String>, InstanceError> {
-        list_in(&instances_root(env))
+/// Re-flatten the profile named in `config.kdl`'s header into that
+/// file, keeping the private `home/`. What it replaces is kept beside
+/// it as `config.kdl.bak`, replacing an older backup and whatever else
+/// is sitting under that name, the way [`save`] does.
+pub fn reseed(env: &Env, name: &str) -> Result<Instance, InstanceError> {
+    let cfg_path = config_path_checked(env, name)?;
+    // A running sandbox was built from the file as it stands, and
+    // bwrap cannot be told about a bind after the fact: rewriting it
+    // now would describe grants that sandbox does not have.
+    if crate::exec::connect(env, name)
+        .map_err(InstanceError::Probe)?
+        .is_some()
+    {
+        return Err(InstanceError::AlreadyRunning(name.to_owned()));
     }
+    let text = read_config(&cfg_path)?;
+    let profile_name =
+        profile_header(&text).ok_or_else(|| InstanceError::NoProfileHeader(cfg_path.clone()))?;
+    let (fresh, config) = seed(env, profile_name, &[])?;
+    let dir = instances_root(env).join(name);
+    write_atomic(&dir.join(BACKUP_FILE), &text)?;
+    write_atomic(&cfg_path, &fresh)?;
+    Ok(Instance {
+        name: name.to_owned(),
+        dir,
+        config,
+        config_version: Some(CONFIG_VERSION),
+    })
+}
 
-    /// Remove the instance directory, including its private home, and its
-    /// runtime directory. Refuses to follow a symlink in place of the
-    /// instance directory.
-    pub fn delete(env: &Env, name: &str) -> Result<(), InstanceError> {
-        validate_name(name)?;
-        let dir = instances_root(env).join(name);
-        let meta = match fs::symlink_metadata(&dir) {
-            Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(InstanceError::NotFound(name.to_owned()));
-            }
-            Err(e) => return Err(InstanceError::Io(dir, e)),
-        };
-        if meta.file_type().is_symlink() {
-            return Err(InstanceError::IsSymlink(dir));
-        }
-        fs::remove_dir_all(&dir).map_err(io_err(&dir))?;
-        let run = env.runtime_dir.join(launcher::RUNTIME_SUBDIR).join(name);
-        match fs::remove_dir_all(&run) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(InstanceError::Io(run, e)),
+/// Record the current version in a config that does not already, by
+/// replacing an older header or writing one after the profile header.
+/// `true` when the file was changed. What it records is that the file
+/// has been read against the current meanings, which is what
+/// [`Instance::migration_warning`] stops warning about.
+pub fn mark_version(env: &Env, name: &str) -> Result<bool, InstanceError> {
+    let cfg_path = config_path_checked(env, name)?;
+    let text = read_config(&cfg_path)?;
+    if config_version(&text).is_some_and(|v| v >= CONFIG_VERSION) {
+        return Ok(false);
+    }
+    let header = format!("{CONFIG_HEADER}{CONFIG_VERSION}");
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    // An older header is replaced where it stands; without one the
+    // line goes under the profile header, or at the top.
+    match lines
+        .iter()
+        .position(|l| l.trim_start().starts_with(CONFIG_HEADER))
+    {
+        Some(i) => lines[i] = header,
+        None => {
+            let at = usize::from(lines.first().is_some_and(|l| l.starts_with(PROFILE_HEADER)));
+            lines.insert(at, header);
         }
     }
-
-    /// Write `config` back to `config.kdl`, keeping the headers the file
-    /// carries: the profile it was seeded from, so `reseed` still knows
-    /// where to re-flatten it from, and the config version. `config.kdl`
-    /// and `config.kdl.bak` are written through [`fsutil::write_atomic`]:
-    /// a symlink left under either name is replaced rather than written
-    /// through.
-    pub fn save(&self, config: &InstanceConfig) -> Result<(), InstanceError> {
-        let cfg_path = self.config_path();
-        let held = read_config(&cfg_path)?;
-        let mut text = String::new();
-        // A profile is only named where the file already named one: a
-        // header invented here would send `reseed` to somebody else's
-        // profile. The name passed the profile grammar to be read as a
-        // header at all, so it holds no newline of its own.
-        if let Some(profile_name) = profile_header(&held) {
-            text.push_str(&format!("{PROFILE_HEADER}{profile_name}\n"));
-        }
-        text.push_str(&format!("{CONFIG_HEADER}{CONFIG_VERSION}\n"));
-        text.push_str(&kdl_out::render(config)?);
-        // Read back before anything is written, the way a seed is: a file
-        // the parser would refuse is an instance that cannot be opened
-        // again, and the checks across nodes (`camera` needs `portals`)
-        // are only made here.
-        config::parse(&text)?;
-        write_atomic(&self.dir.join(BACKUP_FILE), &held)?;
-        write_atomic(&cfg_path, &text)
-    }
-
-    /// Re-flatten the profile named in `config.kdl`'s header into that
-    /// file, keeping the private `home/`. What it replaces is kept beside
-    /// it as `config.kdl.bak`, replacing an older backup and whatever else
-    /// is sitting under that name, the way [`Instance::save`] does.
-    pub fn reseed(env: &Env, name: &str) -> Result<Self, InstanceError> {
-        let cfg_path = config_path_checked(env, name)?;
-        // A running sandbox was built from the file as it stands, and
-        // bwrap cannot be told about a bind after the fact: rewriting it
-        // now would describe grants that sandbox does not have.
-        if crate::exec::connect(env, name)
-            .map_err(InstanceError::Probe)?
-            .is_some()
-        {
-            return Err(InstanceError::AlreadyRunning(name.to_owned()));
-        }
-        let text = read_config(&cfg_path)?;
-        let profile_name = profile_header(&text)
-            .ok_or_else(|| InstanceError::NoProfileHeader(cfg_path.clone()))?;
-        let (fresh, config) = seed(env, profile_name, &[])?;
-        let dir = instances_root(env).join(name);
-        write_atomic(&dir.join(BACKUP_FILE), &text)?;
-        write_atomic(&cfg_path, &fresh)?;
-        Ok(Self {
-            name: name.to_owned(),
-            dir,
-            config,
-            config_version: Some(CONFIG_VERSION),
-        })
-    }
-
-    /// Record the current version in a config that does not already, by
-    /// replacing an older header or writing one after the profile header.
-    /// `true` when the file was changed. What it records is that the file
-    /// has been read against the current meanings, which is what
-    /// [`Instance::migration_warning`] stops warning about.
-    pub fn mark_version(env: &Env, name: &str) -> Result<bool, InstanceError> {
-        let cfg_path = config_path_checked(env, name)?;
-        let text = read_config(&cfg_path)?;
-        if config_version(&text).is_some_and(|v| v >= CONFIG_VERSION) {
-            return Ok(false);
-        }
-        let header = format!("{CONFIG_HEADER}{CONFIG_VERSION}");
-        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
-        // An older header is replaced where it stands; without one the
-        // line goes under the profile header, or at the top.
-        match lines
-            .iter()
-            .position(|l| l.trim_start().starts_with(CONFIG_HEADER))
-        {
-            Some(i) => lines[i] = header,
-            None => {
-                let at = usize::from(lines.first().is_some_and(|l| l.starts_with(PROFILE_HEADER)));
-                lines.insert(at, header);
-            }
-        }
-        let mut marked = lines.join("\n");
-        marked.push('\n');
-        write_atomic(&cfg_path, &marked)?;
-        Ok(true)
-    }
-
-    /// What a run of this instance has to say about its config before it
-    /// starts: a node whose meaning changed after the version the file
-    /// records asks for a different sandbox now than it did when it was
-    /// written. A file recording no version counts as version 1. One
-    /// string per migration the file has not been through, since a file
-    /// old enough may not have been through either.
-    pub fn migration_warning(&self) -> Vec<String> {
-        let written = self.config_version.unwrap_or(1);
-        let services = &self.config.services;
-        let name = &self.name;
-        let mut out = Vec::new();
-        if written < ISOLATED_NETWORK_VERSION
-            && services
-                .iter()
-                .any(|s| matches!(s, Service::Network(c) if c.is_isolated()))
-        {
-            out.push(format!(
-                "`network` now means an isolated network namespace; run \
-                 `bubbler reseed {name}` to write the config again from its profile, or \
-                 `bubbler edit {name}` to keep your own edits and record the version, \
-                 or write `network \"host\"` to keep the old behaviour"
-            ));
-        }
-        if written < PORTAL_CHILDREN_VERSION
-            && services
-                .iter()
-                .any(|s| matches!(s, Service::Portals { children } if children.is_empty()))
-        {
-            out.push(format!(
-                "a bare `portals` no longer opens ScreenCast, RemoteDesktop, InputCapture, \
-                 GlobalShortcuts, Background, DynamicLauncher, Location or Secret: each is \
-                 a child written inside the node, such as `portals {{ screencast }}` for \
-                 screen sharing, and the others are `remote-desktop`, `global-shortcuts`, \
-                 `background`, `location`, `secrets` and `camera`; run \
-                 `bubbler reseed {name}` to write the config again from its profile, or \
-                 `bubbler edit {name}` to add the children this application needs and \
-                 record the version"
-            ));
-        }
-        out
-    }
-
-    /// Whether `s` is among the granted services.
-    pub fn has_service(&self, s: &Service) -> bool {
-        self.config.services.contains(s)
-    }
+    let mut marked = lines.join("\n");
+    marked.push('\n');
+    write_atomic(&cfg_path, &marked)?;
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Clipboard;
+    use crate::config::{Clipboard, NetworkConfig, Service, WaylandMode, X11Mode};
 
     fn env(data_home: &Path) -> Env {
         Env {
@@ -826,7 +475,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let env = env(tmp.path());
         assert!(Instance::list(&env).unwrap().is_empty());
-        let inst = Instance::create(&env, "ff", "generic").unwrap();
+        let inst = create(&env, "ff", "generic").unwrap();
         assert!(inst.home().is_dir());
         assert!(inst.config_path().is_file());
         assert_eq!(inst.config, InstanceConfig::default());
@@ -842,7 +491,7 @@ mod tests {
     fn a_config_past_the_size_bound_is_refused_by_open() {
         let tmp = tempfile::tempdir().unwrap();
         let env = env(tmp.path());
-        let inst = Instance::create(&env, "ff", "generic").unwrap();
+        let inst = create(&env, "ff", "generic").unwrap();
         fs::write(inst.config_path(), "a".repeat(config::MAX_BYTES + 1)).unwrap();
         let refused = Instance::open(&env, "ff");
         assert!(
@@ -872,11 +521,10 @@ mod tests {
         let fits = 107 - prefix - "/dbus/system".len();
         let name = "a".repeat(fits);
         assert_eq!(longest(&name).as_os_str().len(), 107);
-        assert!(Instance::create(&e, &name, "generic").is_ok(), "{fits}");
+        assert!(create(&e, &name, "generic").is_ok(), "{fits}");
 
         let name = "b".repeat(fits + 1);
-        let Err(InstanceError::SocketPathTooLong(path)) = Instance::create(&e, &name, "generic")
-        else {
+        let Err(InstanceError::SocketPathTooLong(path)) = create(&e, &name, "generic") else {
             panic!("a name one byte too long was accepted");
         };
         assert_eq!(path, longest(&name));
@@ -896,8 +544,7 @@ mod tests {
                 .len(),
             107
         );
-        let Err(InstanceError::SocketPathTooLong(path)) = Instance::create(&e, &name, "generic")
-        else {
+        let Err(InstanceError::SocketPathTooLong(path)) = create(&e, &name, "generic") else {
             panic!("a name whose proxy socket is truncated was accepted");
         };
         assert_eq!(path, longest(&name));
@@ -907,12 +554,12 @@ mod tests {
     fn save_keeps_the_headers_and_the_file_it_replaced() {
         let tmp = tempfile::tempdir().unwrap();
         let env = env(tmp.path());
-        let inst = Instance::create(&env, "ff", "firefox").unwrap();
+        let inst = create(&env, "ff", "firefox").unwrap();
         let seeded = fs::read_to_string(inst.config_path()).unwrap();
         let mut edited = inst.config.clone();
         edited.services.push(Service::X11(X11Mode::default()));
         edited.desktop = Some("firefox.desktop".to_owned());
-        inst.save(&edited).unwrap();
+        save(&inst, &edited).unwrap();
 
         let text = fs::read_to_string(inst.config_path()).unwrap();
         let mut lines = text.lines();
@@ -945,7 +592,7 @@ mod tests {
 
         // The profile header survived, so the instance can still be
         // re-flattened from the profile it came from.
-        let reseeded = Instance::reseed(&env, "ff").unwrap();
+        let reseeded = reseed(&env, "ff").unwrap();
         assert_eq!(reseeded.config, inst.config);
         assert!(reseeded.migration_warning().is_empty());
     }
@@ -954,14 +601,14 @@ mod tests {
     fn a_backup_never_writes_through_a_symlink_left_under_its_name() {
         let tmp = tempfile::tempdir().unwrap();
         let env = env(tmp.path());
-        let inst = Instance::create(&env, "ff", "firefox").unwrap();
+        let inst = create(&env, "ff", "firefox").unwrap();
         let seeded = fs::read_to_string(inst.config_path()).unwrap();
         let elsewhere = tmp.path().join("elsewhere");
         let backup = inst.dir.join(BACKUP_FILE);
         std::os::unix::fs::symlink(&elsewhere, &backup).unwrap();
         let mut edited = inst.config.clone();
         edited.services.push(Service::X11(X11Mode::default()));
-        inst.save(&edited).unwrap();
+        save(&inst, &edited).unwrap();
         assert!(!elsewhere.exists(), "the backup was written through a link");
         assert!(!fs::symlink_metadata(&backup).unwrap().is_symlink());
         assert_eq!(fs::read_to_string(&backup).unwrap(), seeded);
@@ -971,7 +618,7 @@ mod tests {
         let saved = fs::read_to_string(inst.config_path()).unwrap();
         fs::remove_file(&backup).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &backup).unwrap();
-        Instance::reseed(&env, "ff").unwrap();
+        reseed(&env, "ff").unwrap();
         assert!(!elsewhere.exists(), "the backup was written through a link");
         assert_eq!(fs::read_to_string(&backup).unwrap(), saved);
     }
@@ -980,7 +627,7 @@ mod tests {
     fn save_writes_no_profile_header_where_the_file_named_no_profile() {
         let tmp = tempfile::tempdir().unwrap();
         let env = env(tmp.path());
-        let inst = Instance::create(&env, "hand", "generic").unwrap();
+        let inst = create(&env, "hand", "generic").unwrap();
         // A config written by hand, with neither header.
         fs::write(
             inst.config_path(),
@@ -990,13 +637,13 @@ mod tests {
         .unwrap();
         let inst = Instance::open(&env, "hand").unwrap();
         assert_eq!(inst.config_version, None);
-        inst.save(&inst.config).unwrap();
+        save(&inst, &inst.config).unwrap();
         let text = fs::read_to_string(inst.config_path()).unwrap();
         // No profile is invented for it: there is none to re-flatten from,
         // and a header naming one would send `reseed` to the wrong file.
         assert_eq!(text, format!("{CONFIG_HEADER}{CONFIG_VERSION}\nwayland\n"));
         assert!(matches!(
-            Instance::reseed(&env, "hand"),
+            reseed(&env, "hand"),
             Err(InstanceError::NoProfileHeader(_))
         ));
     }
@@ -1005,7 +652,7 @@ mod tests {
     fn save_refuses_a_config_it_could_not_read_back() {
         let tmp = tempfile::tempdir().unwrap();
         let env = env(tmp.path());
-        let inst = Instance::create(&env, "c", "generic").unwrap();
+        let inst = create(&env, "c", "generic").unwrap();
         let seeded = fs::read_to_string(inst.config_path()).unwrap();
         // `camera` without `portals` renders, and the parser refuses it:
         // saved, the instance could not be opened again.
@@ -1014,7 +661,7 @@ mod tests {
             ..InstanceConfig::default()
         };
         assert!(matches!(
-            inst.save(&broken),
+            save(&inst, &broken),
             Err(InstanceError::Config(config::ConfigError::BadArgument { ref node, .. }))
                 if node == "camera"
         ));
@@ -1027,7 +674,7 @@ mod tests {
     fn home_dir_is_private() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
-        let inst = Instance::create(&env(tmp.path()), "p", "generic").unwrap();
+        let inst = create(&env(tmp.path()), "p", "generic").unwrap();
         let mode = std::fs::metadata(inst.home()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
     }
@@ -1036,9 +683,9 @@ mod tests {
     fn create_twice_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let env = env(tmp.path());
-        Instance::create(&env, "a", "generic").unwrap();
+        create(&env, "a", "generic").unwrap();
         assert!(matches!(
-            Instance::create(&env, "a", "generic"),
+            create(&env, "a", "generic"),
             Err(InstanceError::AlreadyExists(_))
         ));
     }
@@ -1051,7 +698,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::os::unix::fs::symlink("/nonexistent", root.join("dangle")).unwrap();
         assert!(matches!(
-            Instance::create(&env, "dangle", "generic"),
+            create(&env, "dangle", "generic"),
             Err(InstanceError::AlreadyExists(_))
         ));
     }
@@ -1069,21 +716,21 @@ mod tests {
         for bad in ["", ".", "..", "-x", "a/b", "a b", "é", "try-1", "try-04321"] {
             assert!(
                 matches!(
-                    Instance::create(&env, bad, "generic"),
+                    create(&env, bad, "generic"),
                     Err(InstanceError::InvalidName(_))
                 ),
                 "{bad:?}"
             );
         }
         assert!(matches!(
-            Instance::create(&env, "ok", "nope"),
+            create(&env, "ok", "nope"),
             Err(InstanceError::Profile(
                 crate::error::ProfileError::NotFound(_)
             ))
         ));
         // Only that exact shape is reserved.
         for ok in ["try", "try-", "try-x", "try-1a", "tryout"] {
-            assert!(Instance::create(&env, ok, "generic").is_ok(), "{ok:?}");
+            assert!(create(&env, ok, "generic").is_ok(), "{ok:?}");
         }
     }
 
@@ -1097,7 +744,7 @@ mod tests {
     fn a_config_without_the_version_header_warns_about_a_bare_network() {
         let tmp = tempfile::tempdir().unwrap();
         let env = env(tmp.path());
-        let inst = Instance::create(&env, "e", "generic").unwrap();
+        let inst = create(&env, "e", "generic").unwrap();
         assert_eq!(inst.config_version, Some(CONFIG_VERSION));
         assert!(inst.migration_warning().is_empty());
 
@@ -1149,7 +796,7 @@ mod tests {
     fn a_config_written_before_the_portal_children_warns_about_a_bare_portals() {
         let tmp = tempfile::tempdir().unwrap();
         let env = env(tmp.path());
-        let inst = Instance::create(&env, "e", "generic").unwrap();
+        let inst = create(&env, "e", "generic").unwrap();
 
         let cases = [
             ("dbus\nportals\n", 1),
@@ -1180,7 +827,7 @@ mod tests {
         assert!(w.contains("bubbler edit e"), "{w}");
 
         // And the version this bubbler writes clears it.
-        assert!(Instance::mark_version(&env, "e").unwrap());
+        assert!(mark_version(&env, "e").unwrap());
         assert!(
             Instance::open(&env, "e")
                 .unwrap()
@@ -1193,15 +840,15 @@ mod tests {
     fn marking_the_version_writes_one_header_under_the_profile_line() {
         let tmp = tempfile::tempdir().unwrap();
         let env = env(tmp.path());
-        let inst = Instance::create(&env, "e", "generic").unwrap();
+        let inst = create(&env, "e", "generic").unwrap();
         std::fs::write(inst.config_path(), "// bubbler profile: generic\nnetwork\n").unwrap();
-        assert!(Instance::mark_version(&env, "e").unwrap());
+        assert!(mark_version(&env, "e").unwrap());
         assert_eq!(
             std::fs::read_to_string(inst.config_path()).unwrap(),
             format!("// bubbler profile: generic\n{CONFIG_HEADER}{CONFIG_VERSION}\nnetwork\n")
         );
         // Idempotent: a file that already records a version is left alone.
-        assert!(!Instance::mark_version(&env, "e").unwrap());
+        assert!(!mark_version(&env, "e").unwrap());
         assert!(
             Instance::open(&env, "e")
                 .unwrap()
@@ -1211,7 +858,7 @@ mod tests {
 
         // Without a profile header the version goes to the top.
         std::fs::write(inst.config_path(), "network\n").unwrap();
-        assert!(Instance::mark_version(&env, "e").unwrap());
+        assert!(mark_version(&env, "e").unwrap());
         assert_eq!(
             std::fs::read_to_string(inst.config_path()).unwrap(),
             format!("{CONFIG_HEADER}{CONFIG_VERSION}\nnetwork\n")
@@ -1223,7 +870,7 @@ mod tests {
             "// bubbler profile: generic\n// bubbler config: 1\nnetwork\n",
         )
         .unwrap();
-        assert!(Instance::mark_version(&env, "e").unwrap());
+        assert!(mark_version(&env, "e").unwrap());
         assert_eq!(
             std::fs::read_to_string(inst.config_path()).unwrap(),
             format!("// bubbler profile: generic\n{CONFIG_HEADER}{CONFIG_VERSION}\nnetwork\n")
@@ -1234,7 +881,7 @@ mod tests {
     fn open_reads_edited_config() {
         let tmp = tempfile::tempdir().unwrap();
         let env = env(tmp.path());
-        let inst = Instance::create(&env, "e", "generic").unwrap();
+        let inst = create(&env, "e", "generic").unwrap();
         std::fs::write(inst.config_path(), "network\ncommand \"true\"\n").unwrap();
         let inst = Instance::open(&env, "e").unwrap();
         assert_eq!(
@@ -1254,17 +901,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut env = env(tmp.path());
         env.runtime_dir = tmp.path().join("run");
-        Instance::create(&env, "a", "generic").unwrap();
+        create(&env, "a", "generic").unwrap();
         std::fs::write(instances_root(&env).join("a/home/file"), b"x").unwrap();
         let run = env.runtime_dir.join("bubbler").join("a");
         std::fs::create_dir_all(&run).unwrap();
-        Instance::delete(&env, "a").unwrap();
+        delete(&env, "a").unwrap();
         assert!(!instances_root(&env).join("a").exists());
         assert!(!run.exists());
-        assert!(matches!(
-            Instance::delete(&env, "a"),
-            Err(InstanceError::NotFound(_))
-        ));
+        assert!(matches!(delete(&env, "a"), Err(InstanceError::NotFound(_))));
         std::fs::create_dir_all(tmp.path().join("elsewhere")).unwrap();
         std::os::unix::fs::symlink(
             tmp.path().join("elsewhere"),
@@ -1272,7 +916,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            Instance::delete(&env, "lnk"),
+            delete(&env, "lnk"),
             Err(InstanceError::IsSymlink(_))
         ));
         assert!(tmp.path().join("elsewhere").exists());
@@ -1290,7 +934,7 @@ mod tests {
             config_path_checked(&env, "zz"),
             Err(InstanceError::NotFound(_))
         ));
-        let inst = Instance::create(&env, "b", "generic").unwrap();
+        let inst = create(&env, "b", "generic").unwrap();
         std::fs::write(inst.config_path(), "bogus\n").unwrap();
         assert_eq!(config_path_checked(&env, "b").unwrap(), inst.config_path());
         std::fs::remove_file(inst.config_path()).unwrap();
@@ -1310,7 +954,7 @@ mod tests {
         let pid = std::process::id();
         let run = env.runtime_dir.join("bubbler").join(format!("try-{pid}"));
         let dir = {
-            let eph = Instance::ephemeral(&env, "generic", &["network"]).unwrap();
+            let eph = ephemeral(&env, "generic", &["network"]).unwrap();
             assert_eq!(eph.instance.name, format!("try-{pid}"));
             assert_eq!(eph.instance.dir, try_root(&env).join(pid.to_string()));
             assert_eq!(
@@ -1337,7 +981,7 @@ mod tests {
         let mut env = env(tmp.path());
         env.runtime_dir = tmp.path().join("run");
         {
-            let mut eph = Instance::ephemeral(&env, "generic", &[]).unwrap();
+            let mut eph = ephemeral(&env, "generic", &[]).unwrap();
             assert!(matches!(
                 eph.keep_as(&env, "-x"),
                 Err(InstanceError::InvalidName(_))
@@ -1354,7 +998,7 @@ mod tests {
         assert_eq!(Instance::list(&env).unwrap(), vec!["kept".to_string()]);
         assert!(Instance::open(&env, "kept").unwrap().home().is_dir());
         assert!(try_root(&env).read_dir().unwrap().next().is_none());
-        let mut eph = Instance::ephemeral(&env, "generic", &[]).unwrap();
+        let mut eph = ephemeral(&env, "generic", &[]).unwrap();
         assert!(matches!(
             eph.keep_as(&env, "kept"),
             Err(InstanceError::AlreadyExists(_))
@@ -1366,10 +1010,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut env = env(tmp.path());
         env.runtime_dir = tmp.path().join("run");
-        let err = Instance::ephemeral(&env, "generic", &["bogus"]).unwrap_err();
+        let err = ephemeral(&env, "generic", &["bogus"]).unwrap_err();
         assert!(matches!(err, InstanceError::InvalidGrant(_)));
         assert!(err.to_string().contains("wayland"), "{err}");
-        let eph = Instance::ephemeral(&env, "firefox", &["dri", "dri", "network"]).unwrap();
+        let eph = ephemeral(&env, "firefox", &["dri", "dri", "network"]).unwrap();
         let services = &eph.instance.config.services;
         assert!(services.contains(&Service::Network(NetworkConfig::default())));
         assert_eq!(
@@ -1383,7 +1027,7 @@ mod tests {
         // A grant whose node carries a mode is held whichever mode the
         // profile wrote it in: a second node would be a duplicate, and
         // the bare grant must not quietly replace `"host"` either.
-        let eph = Instance::ephemeral(&env, "steam", &["x11", "wayland"]).unwrap();
+        let eph = ephemeral(&env, "steam", &["x11", "wayland"]).unwrap();
         let services = &eph.instance.config.services;
         assert_eq!(
             services
@@ -1418,7 +1062,7 @@ mod tests {
                 clipboard: Clipboard::Open
             })]
         );
-        let eph = Instance::ephemeral(&env, "generic", &["gamepad", "dbus", "tray"]).unwrap();
+        let eph = ephemeral(&env, "generic", &["gamepad", "dbus", "tray"]).unwrap();
         let services = &eph.instance.config.services;
         assert!(services.contains(&Service::Gamepad {
             hidraw: false,
@@ -1430,21 +1074,21 @@ mod tests {
         // usual, and nothing is created for a config that cannot run.
         for grant in ["portals", "tray"] {
             assert!(matches!(
-                Instance::ephemeral(&env, "generic", &[grant]),
+                ephemeral(&env, "generic", &[grant]),
                 Err(InstanceError::Config(_))
             ));
         }
         // `camera` is granted the same way, and takes the `portals` that
         // carry it rather than binding a device node of its own.
         assert!(matches!(
-            Instance::ephemeral(&env, "generic", &["camera"]),
+            ephemeral(&env, "generic", &["camera"]),
             Err(InstanceError::Config(_))
         ));
         assert!(matches!(
-            Instance::ephemeral(&env, "generic", &["dbus", "camera"]),
+            ephemeral(&env, "generic", &["dbus", "camera"]),
             Err(InstanceError::Config(_))
         ));
-        let eph = Instance::ephemeral(&env, "generic", &["dbus", "portals", "camera"]).unwrap();
+        let eph = ephemeral(&env, "generic", &["dbus", "portals", "camera"]).unwrap();
         assert!(
             eph.instance
                 .config
@@ -1460,7 +1104,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut env = env(tmp.path());
         env.runtime_dir = tmp.path().join("run");
-        let eph = Instance::ephemeral(&env, "generic", &["hidraw"]).unwrap();
+        let eph = ephemeral(&env, "generic", &["hidraw"]).unwrap();
         assert_eq!(eph.instance.config.services, vec![Service::Hidraw]);
         drop(eph);
         // The older spelling is a different node, so a profile carrying
@@ -1477,53 +1121,6 @@ mod tests {
                 Service::Hidraw
             ]
         );
-    }
-
-    #[test]
-    fn a_grant_the_config_already_made_keeps_its_properties() {
-        // The parser takes one `gamepad` node, so a bare grant on top of
-        // a node carrying properties must leave that node alone rather
-        // than add a second, narrower one.
-        let mut cfg = config::parse("gamepad hidraw=#true").unwrap();
-        with_grants(&mut cfg, &["gamepad"]).unwrap();
-        assert_eq!(
-            cfg.services,
-            vec![Service::Gamepad {
-                hidraw: true,
-                uinput: false
-            }]
-        );
-        assert_eq!(kdl_out::render(&cfg).unwrap(), "gamepad hidraw=#true\n");
-    }
-
-    #[test]
-    fn a_camera_grant_leaves_a_device_grant_in_the_config_alone() {
-        // The parser takes one `camera` node, so a bare grant on top of
-        // `nodes=#true` must not narrow what the config already granted.
-        let mut cfg = config::parse("dbus\nportals\ncamera nodes=#true").unwrap();
-        with_grants(&mut cfg, &["camera"]).unwrap();
-        assert_eq!(cfg.services.last(), Some(&Service::Camera { nodes: true }));
-        assert!(
-            kdl_out::render(&cfg)
-                .unwrap()
-                .contains("camera nodes=#true\n")
-        );
-    }
-
-    #[test]
-    fn every_listed_grant_names_a_service() {
-        // The list is what the error message offers; a name on it that no
-        // service answers to would be an offer bubbler cannot keep.
-        for g in GRANTS {
-            assert!(grant_service(g).is_some(), "{g}");
-        }
-        // A node that takes an argument is not a grant: `--grant` writes
-        // a bare node, and `app-runtime` without its id would name no
-        // directory.
-        for named in ["home-share", "app-runtime"] {
-            assert!(grant_service(named).is_none(), "{named}");
-            assert!(!GRANTS.contains(&named), "{named}");
-        }
     }
 
     /// A portal child is a grant name of its own, and granting one on a
@@ -1564,7 +1161,7 @@ mod tests {
         let mut env = env(tmp.path());
         env.runtime_dir = tmp.path().join("run");
         assert!(matches!(
-            Instance::ephemeral(&env, "generic", &["screencast"]),
+            ephemeral(&env, "generic", &["screencast"]),
             Err(InstanceError::Config(_))
         ));
     }
@@ -1573,7 +1170,7 @@ mod tests {
     fn a_created_config_names_the_profile_it_was_flattened_from() {
         let tmp = tempfile::tempdir().unwrap();
         let env = env(tmp.path());
-        let inst = Instance::create(&env, "ff", "firefox").unwrap();
+        let inst = create(&env, "ff", "firefox").unwrap();
         let text = fs::read_to_string(inst.config_path()).unwrap();
         assert!(text.starts_with("// bubbler profile: firefox\n"), "{text}");
         assert_eq!(config::parse(&text).unwrap(), inst.config);
@@ -1587,13 +1184,13 @@ mod tests {
         let env = env(tmp.path());
         // `generic` flattens to no nodes, so the file would otherwise hold
         // its header and nothing an editor could work from.
-        let inst = Instance::create(&env, "g", "generic").unwrap();
+        let inst = create(&env, "g", "generic").unwrap();
         let text = fs::read_to_string(inst.config_path()).unwrap();
         assert!(text.contains("//   home-share \"Downloads\""), "{text}");
         assert_eq!(config::parse(&text).unwrap(), InstanceConfig::default());
 
         // A profile with a node of its own is written as itself.
-        let inst = Instance::create(&env, "ff", "firefox").unwrap();
+        let inst = create(&env, "ff", "firefox").unwrap();
         let text = fs::read_to_string(inst.config_path()).unwrap();
         assert!(!text.contains("//   home-share"), "{text}");
     }
@@ -1656,34 +1253,13 @@ mod tests {
             .join("bubbler")
             .join(format!("try-{}", std::process::id()));
         let dir = {
-            let mut eph = Instance::ephemeral(&env, "generic", &[]).unwrap();
+            let mut eph = ephemeral(&env, "generic", &[]).unwrap();
             fs::create_dir_all(&run).unwrap();
             eph.disarm_runtime();
             eph.instance.dir.clone()
         };
         assert!(!dir.exists());
         assert!(run.is_dir());
-    }
-
-    #[test]
-    fn only_the_header_seed_writes_names_a_profile() {
-        assert_eq!(
-            profile_header("// bubbler profile: ff\nwayland\n"),
-            Some("ff")
-        );
-        assert_eq!(profile_header("// bubbler profile: ff"), Some("ff"));
-        assert_eq!(profile_header("// bubbler profile: ff \n"), Some("ff"));
-        for bad in [
-            "",
-            "wayland\n",
-            "// bubbler profile:\n",
-            "// bubbler profile: \n",
-            "//bubbler profile: ff\n",
-            "// bubbler profile: ../escape\n",
-            "wayland\n// bubbler profile: ff\n",
-        ] {
-            assert_eq!(profile_header(bad), None, "{bad:?}");
-        }
     }
 
     /// Write `text` as the user layer's profile `name`.
@@ -1699,12 +1275,12 @@ mod tests {
         let mut env = env(tmp.path());
         env.runtime_dir = tmp.path().join("run");
         user_profile(&env, "app", "wayland\n");
-        let inst = Instance::create(&env, "a", "app").unwrap();
+        let inst = create(&env, "a", "app").unwrap();
         let before = fs::read_to_string(inst.config_path()).unwrap();
         fs::write(inst.home().join("data"), b"kept").unwrap();
 
         user_profile(&env, "app", "wayland\nnetwork\n");
-        let after = Instance::reseed(&env, "a").unwrap();
+        let after = reseed(&env, "a").unwrap();
         assert!(
             after
                 .config
@@ -1728,7 +1304,7 @@ mod tests {
 
         // A second reseed overwrites the backup rather than refusing.
         user_profile(&env, "app", "dri\n");
-        let after = Instance::reseed(&env, "a").unwrap();
+        let after = reseed(&env, "a").unwrap();
         assert!(after.config.services.contains(&Service::Dri { kms: false }));
         assert!(
             fs::read_to_string(after.dir.join(BACKUP_FILE))
@@ -1753,13 +1329,13 @@ mod tests {
         let mut env = env(tmp.path());
         env.runtime_dir = tmp.path().join("run");
         assert!(matches!(
-            Instance::reseed(&env, "gone"),
+            reseed(&env, "gone"),
             Err(InstanceError::NotFound(_))
         ));
-        let inst = Instance::create(&env, "a", "generic").unwrap();
+        let inst = create(&env, "a", "generic").unwrap();
         fs::write(inst.config_path(), "wayland\n").unwrap();
         assert!(matches!(
-            Instance::reseed(&env, "a"),
+            reseed(&env, "a"),
             Err(InstanceError::NoProfileHeader(p)) if p == inst.config_path()
         ));
         assert!(!inst.dir.join(BACKUP_FILE).exists());
@@ -1771,7 +1347,7 @@ mod tests {
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         fs::write(inst.config_path(), "// bubbler profile: generic\n").unwrap();
         assert!(matches!(
-            Instance::reseed(&env, "a"),
+            reseed(&env, "a"),
             Err(InstanceError::AlreadyRunning(n)) if n == "a"
         ));
         assert_eq!(
