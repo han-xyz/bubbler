@@ -47,7 +47,8 @@ use crate::host::{Host, RealHost};
 use crate::instance::Instance;
 pub use crate::paths::{RUNTIME_SUBDIR, instance_runtime_dir};
 pub(crate) use crate::paths::{START_LOCK_SUFFIX, start_lock_path};
-use crate::tty::{self, Pty, RawGuard, RelayEnd, StdioTarget, TtyMode};
+use crate::tty::{self, Pty, StdioTarget, TtyMode};
+use crate::tty_relay::{self, RawGuard, RelayEnd};
 use crate::wayland::{ProxyPlan, WaylandError};
 use crate::{
     cgroup, dbus, dbus_a11y, exec, init_bin, network, pipewire, proc, run_log, seccomp, service,
@@ -1598,7 +1599,7 @@ struct PastaHandle {
 impl PastaHandle {
     // The sandbox keeps running, unconnected. The relay's warning channel, not `eprintln!`: one
     // blocking terminal write would park the loop answering the exit check and the signals.
-    fn check(&mut self, warn: &tty::Warn) {
+    fn check(&mut self, warn: &tty_relay::Warn) {
         if self.exited {
             return;
         }
@@ -1996,7 +1997,7 @@ struct NetProxyHandle {
 
 impl NetProxyHandle {
     // The sandbox keeps running: its filter is unchanged, it only loses its one way out.
-    fn check(&mut self, warn: &tty::Warn) {
+    fn check(&mut self, warn: &tty_relay::Warn) {
         if self.exited {
             return;
         }
@@ -2043,7 +2044,7 @@ struct NetworkSidecars {
 }
 
 impl NetworkSidecars {
-    fn check(&mut self, warn: &tty::Warn) {
+    fn check(&mut self, warn: &tty_relay::Warn) {
         self.pasta.check(warn);
         if let Some(proxy) = self.proxy.as_mut() {
             proxy.check(warn);
@@ -2778,7 +2779,7 @@ struct Watch<'a> {
     supervisor: Option<Pid>,
     stopping: &'a AtomicBool,
     network: &'a mut Option<NetworkSidecars>,
-    warn: &'a tty::Warn,
+    warn: &'a tty_relay::Warn,
     // Taken into `ending` when the exit is seen, not once the output is drained.
     start_lock: &'a Path,
     ending: Option<OwnedFd>,
@@ -2848,7 +2849,7 @@ fn wait_pumping(
     let stopping = w.stopping;
     let code = {
         let mut until = until_exit(child, w, &mut failed);
-        tty::pump(pipes, sink, &mut until, stopping)?
+        tty_relay::pump(pipes, sink, &mut until, stopping)?
     };
     match failed {
         Some(e) => Err(LaunchError::Spawn(e)),
@@ -2868,7 +2869,7 @@ struct RelayEnds<'a> {
 fn wait_relaying(
     child: &mut Child,
     w: &mut Watch<'_>,
-    caught: &tty::Caught<'_>,
+    caught: &tty_relay::Caught<'_>,
     master: BorrowedFd<'_>,
     ends: RelayEnds<'_>,
     raw: &mut Option<RawGuard<'_>>,
@@ -2876,7 +2877,7 @@ fn wait_relaying(
     let mut failed = None;
     let end = {
         let mut until = until_exit(child, w, &mut failed);
-        tty::relay(
+        tty_relay::relay(
             master,
             ends.input,
             ends.output,
@@ -2896,9 +2897,9 @@ fn wait_relaying(
             if let Some(guard) = raw.as_mut() {
                 guard.restore();
             }
-            eprintln!("{}", tty::DETACHED_NOTE);
+            eprintln!("{}", tty_relay::DETACHED_NOTE);
             let mut until = until_exit(child, w, &mut failed);
-            match tty::relay(
+            match tty_relay::relay(
                 master,
                 None,
                 ends.sink,
@@ -3140,8 +3141,8 @@ fn start_and_wait(
     }
     // After the context it connects to, before the sandbox it serves; dropped before the context.
     let _pw_pulse = start_pw_pulse(env, &dir, inst, &RealHost, stop)?;
-    let host = tty::host_stdio()?;
-    let is_tty = tty::host_is_tty();
+    let host = tty_relay::host_stdio()?;
+    let is_tty = tty_relay::host_is_tty();
     let mut stdio = tty::plan(mode, is_tty);
     // Allocated before raw mode, whose settings it would otherwise copy, leaving the sandbox
     // without echo or line editing.
@@ -3150,7 +3151,7 @@ fn start_and_wait(
         .then(|| is_tty.iter().position(|t| *t))
         .flatten()
     {
-        stdio.pty = Some(tty::allocate(host[i].as_fd())?);
+        stdio.pty = Some(tty_relay::allocate(host[i].as_fd())?);
     }
     // Before the argv is built, for the same reason the proxy is: a bind whose source is not there
     // is a failed start, not a warning.
@@ -3279,12 +3280,12 @@ fn start_and_wait(
     });
     // Where output goes that the user's descriptors cannot take, and after a detach: draining
     // keeps a command from blocking on a full pty or pipe.
-    let sink = tty::null_stdio()?;
-    let caught = tty::Caught {
+    let sink = tty_relay::null_stdio()?;
+    let caught = tty_relay::Caught {
         winch: &winch,
         stop: &stopping,
     };
-    let warn = tty::Warn::new();
+    let warn = tty_relay::Warn::new();
     let mut watch = Watch {
         stop,
         supervisor,

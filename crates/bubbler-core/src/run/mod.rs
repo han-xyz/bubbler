@@ -11,6 +11,6 @@ pub mod launcher;
 pub mod proc;
 pub mod profile_ops;
 pub mod run_log;
-pub mod tty;
+pub mod tty_relay;
 pub mod version_probe;
 pub mod wrap_ops;

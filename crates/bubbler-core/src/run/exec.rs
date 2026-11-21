@@ -27,7 +27,8 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 
 use crate::env::Env;
 use crate::error::LaunchError;
-use crate::tty::{self, RawGuard, RelayEnd, StdioPlan, StdioTarget};
+use crate::tty::{self, StdioPlan, StdioTarget};
+use crate::tty_relay::{self, RawGuard, RelayEnd};
 
 pub use crate::paths::{SOCKET_NAME, socket_path};
 
@@ -147,7 +148,7 @@ fn fd_for(
             ))),
         },
         StdioTarget::Inherit => host[index].try_clone().map_err(LaunchError::Pty),
-        StdioTarget::Null => tty::null_stdio(),
+        StdioTarget::Null => tty_relay::null_stdio(),
         StdioTarget::Pipe => {
             // CLOEXEC: only the supervisor's copy of the write end may
             // outlive this call, and it travels by SCM_RIGHTS.
@@ -173,7 +174,7 @@ pub fn run_in(
     argv: &[OsString],
     mode: tty::TtyMode,
 ) -> Result<i32, LaunchError> {
-    run_in_with(stream, argv, mode, tty::host_stdio()?)
+    run_in_with(stream, argv, mode, tty_relay::host_stdio()?)
 }
 
 /// [`run_in`] with `host` standing in for bubbler's own stdin, stdout and
@@ -185,7 +186,7 @@ pub fn run_in_with(
     host: [OwnedFd; 3],
 ) -> Result<i32, LaunchError> {
     let refs: Vec<&OsStr> = argv.iter().map(|a| a.as_os_str()).collect();
-    let is_tty = tty::host_is_tty();
+    let is_tty = tty_relay::host_is_tty();
     let mut plan = tty::plan(mode, is_tty);
     // The pty copies the first terminal bubbler has, and is allocated
     // before raw mode: afterwards it would carry raw settings into the
@@ -195,7 +196,7 @@ pub fn run_in_with(
         .then(|| is_tty.iter().position(|t| *t))
         .flatten()
     {
-        plan.pty = Some(tty::allocate(host[i].as_fd())?);
+        plan.pty = Some(tty_relay::allocate(host[i].as_fd())?);
     }
     let mut pipes: Vec<(OwnedFd, usize)> = Vec::new();
     let mut send: Vec<OwnedFd> = Vec::with_capacity(3);
@@ -242,13 +243,13 @@ pub fn run_in_with(
     // when none of them can be written to at all and when one stops
     // taking it. Draining somewhere is what keeps the command from
     // blocking on a full pty or pipe.
-    let sink = tty::null_stdio()?;
+    let sink = tty_relay::null_stdio()?;
     let mut received: Option<io::Result<i32>> = None;
     let mut signalled: Option<i32> = None;
     // Latched for the relay, which reads it while handing over the last
     // of the output: a signal means the user is waiting for bubbler.
     let stopping = AtomicBool::new(false);
-    let caught = tty::Caught {
+    let caught = tty_relay::Caught {
         winch: &winch,
         stop: &stopping,
     };
@@ -284,7 +285,7 @@ pub fn run_in_with(
                     Some(i) => (host[i].as_fd(), tty::FD_NAMES[i]),
                     None => (sink.as_fd(), tty::FD_NAMES[1]),
                 };
-                tty::relay(
+                tty_relay::relay(
                     master.as_fd(),
                     plan.ctty().then(|| host[0].as_fd()),
                     host_out,
@@ -299,7 +300,7 @@ pub fn run_in_with(
                     .iter()
                     .map(|(read, i)| (read.as_fd(), host[*i].as_fd(), tty::FD_NAMES[*i]))
                     .collect();
-                tty::pump(&ends, sink.as_fd(), &mut until, &stopping)?;
+                tty_relay::pump(&ends, sink.as_fd(), &mut until, &stopping)?;
                 RelayEnd::Exited(0)
             }
             // Nothing of ours to move: the status is all this waits for.
@@ -316,7 +317,7 @@ pub fn run_in_with(
             if let Some(guard) = raw.as_mut() {
                 guard.restore();
             }
-            eprintln!("{}", tty::DETACHED_NOTE);
+            eprintln!("{}", tty_relay::DETACHED_NOTE);
             Ok(0)
         }
         (_, Some(Ok(raw)), _) => Ok(exit_code(ExitStatus::from_raw(raw))),

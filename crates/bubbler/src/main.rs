@@ -38,6 +38,7 @@ use bubbler_core::profile_ops;
 use bubbler_core::run_log;
 use bubbler_core::safe_text;
 use bubbler_core::tty::{self, TtyMode};
+use bubbler_core::tty_relay;
 use bubbler_core::version_probe;
 use bubbler_core::wrap;
 use bubbler_core::wrap_ops;
@@ -1223,7 +1224,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // then acts on.
             let starts = !dry_run && explain_mode.is_none();
             let mut probed = None;
-            if starts && !tty::host_is_tty().iter().any(|t| *t) {
+            if starts && !tty_relay::host_is_tty().iter().any(|t| *t) {
                 let config = instance::config_path_checked(&env, &name).with_context(|| {
                     format!(
                         "opening instance `{name}` ({})",
@@ -1260,7 +1261,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // skipped for both. The argv still depends on this terminal:
             // `--ctty` is there exactly when a real run would allocate a
             // pty for the sandbox's stdin.
-            let ctty = tty::plan(mode, tty::host_is_tty()).ctty();
+            let ctty = tty::plan(mode, tty_relay::host_is_tty()).ctty();
             // Before the arguments are forwarded: a run that is about to
             // be refused must register no document with the portal and
             // warn about none either.
@@ -1352,7 +1353,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // the copy into the log: a child it leaves behind would hold
             // that copy's pipe past this run, which ends it. Under
             // `none` it writes to a pipe bubbler pumps into the copy.
-            let mut host = tty::host_stdio()?;
+            let mut host = tty_relay::host_stdio()?;
             if let Some(redirect) = log.as_ref()
                 && mode != TtyMode::None
             {
@@ -1391,7 +1392,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             let command = forwarded.as_deref().or(given);
             if let Some(mode) = explain_mode {
                 let tty_mode = tty.unwrap_or(eph.instance.config.tty);
-                let ctty = tty::plan(tty_mode, tty::host_is_tty()).ctty();
+                let ctty = tty::plan(tty_mode, tty_relay::host_is_tty()).ctty();
                 let code = explain(
                     &env,
                     &eph.instance,
@@ -1479,7 +1480,7 @@ fn real_main(log: &mut Option<run_log::Redirect>) -> Result<i32> {
             // one on any of the three descriptors means somebody is
             // watching: the run keeps its own stderr and the sandbox is
             // given a terminal.
-            let watched = tty::host_is_tty().iter().any(|t| *t);
+            let watched = tty_relay::host_is_tty().iter().any(|t| *t);
             if !watched {
                 *log = open_log(
                     run_log::redirect,
